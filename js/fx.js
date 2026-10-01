@@ -69,9 +69,13 @@ class Pool {
     this.col[i3] = tmpC.r * j; this.col[i3 + 1] = tmpC.g * j; this.col[i3 + 2] = tmpC.b * j;
     this.s0[i] = size; this.size[i] = size; this.grow[i] = grow; this.life[i] = life; this.age[i] = 0;
     this.a0[i] = alpha; this.alpha[i] = alpha; this.drag[i] = drag; this.grav[i] = grav; this.fl[i] = this.curFloor;
+    this.liveUntil = Math.max(this.liveUntil || 0, (this.clock || 0) + life + 0.05);
   }
   update(dt) {
     const { pos, vel, age, life, alpha, size } = this;
+    // idle pool: everything dead and already zeroed -> skip the loop and the GPU re-upload entirely
+    this.clock = (this.clock || 0) + dt;
+    if (this.clock > (this.liveUntil || 0)) { if (this._idle) return; this._idle = true; } else this._idle = false;
     for (let i = 0; i < this.max; i++) {
       if (age[i] >= life[i]) { if (alpha[i] !== 0) alpha[i] = 0; continue; }
       age[i] += dt; const t = age[i] / life[i];
@@ -86,7 +90,7 @@ class Pool {
     }
     this.aPos.needsUpdate = this.aCol.needsUpdate = this.aAlpha.needsUpdate = this.aSize.needsUpdate = true;
   }
-  clear() { this.age.fill(1e9); this.alpha.fill(0); this.aAlpha.needsUpdate = true; }
+  clear() { this.age.fill(1e9); this.alpha.fill(0); this.aAlpha.needsUpdate = true; this.liveUntil = 0; this._idle = false; }
   dispose() { this.points.removeFromParent(); this.points.geometry.dispose(); this.mat.dispose(); }
 }
 

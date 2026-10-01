@@ -1,4 +1,4 @@
-// Rally Legends — game orchestration: menus, stage loading, race loop, camera, timing, championship.
+// Rally Legends ? game orchestration: menus, stage loading, race loop, camera, timing, championship.
 import * as THREE from './vendor/three.module.js';
 import { loadStage, loadStageIndex, SURFACES } from './stage.js';
 import { Car, TYRE_COMPOUNDS, defaultCompound } from './physics.js';
@@ -37,9 +37,29 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: !isMobile, powerPr
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
+// dynamic resolution: on 'auto' the render scale adapts to hold a steady frame rate. Changing the pixel ratio
+// only resizes the drawing buffer (no shader recompiles), unlike toggling shadows, which froze the game ~1.5 s.
+// the learned scale/cap is remembered per device, so the next stage starts at the right resolution
+// instead of stuttering for the first seconds while the scaler re-learns
+const dynSaved = (() => { try { return JSON.parse(localStorage.getItem('rl.dynres') || 'null'); } catch (_) { return null; } })();
+const dyn = { scale: dynSaved?.scale || 1, t: 0, n: 0, miss: 0, bad: 0, good: 0, hold: 0, minDt: 1, cap: dynSaved?.cap || 0, saved: 0 };
+const saveDyn = () => { try { localStorage.setItem('rl.dynres', JSON.stringify({ scale: +dyn.scale.toFixed(3), cap: dyn.cap })); } catch (_) {} };
+const basePixelRatio = () => {
+  const q = qualityLevel();
+  let pr = Math.min(devicePixelRatio, q === 'high' ? 1.75 : q === 'med' ? 1.35 : 1);
+  // on auto, start from a sane pixel budget (ultrawide/4K screens would otherwise begin GPU-bound and stutter
+  // for the first seconds until the scaler catches up)
+  if (settings.quality === 'auto') { const px = innerWidth * innerHeight, budget = isMobile ? 1.4e6 : 1.9e6; pr = Math.min(pr, Math.sqrt(budget / Math.max(1, px))); }
+  return Math.max(0.5, pr);
+};
+function setRenderScale(s) {
+  dyn.scale = Math.max(0.45, Math.min(1, s));
+  const pr = basePixelRatio() * dyn.scale;
+  if (Math.abs(renderer.getPixelRatio() - pr) > 0.01) renderer.setPixelRatio(pr);
+}
 function applyQuality() {
   const q = qualityLevel();
-  renderer.setPixelRatio(Math.min(devicePixelRatio, q === 'high' ? 1.75 : q === 'med' ? 1.35 : 1));
+  renderer.setPixelRatio(basePixelRatio() * (settings.quality === 'auto' ? dyn.scale : 1));
   renderer.shadowMap.enabled = q === 'high';
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 }
@@ -47,6 +67,7 @@ applyQuality();
 const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 6000);
 function resize() {
   const w = innerWidth, h = innerHeight;
+  if (typeof dyn !== 'undefined') setRenderScale(dyn.scale);
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.fov = w < h ? 78 : 62; // portrait phones need a wider vertical FOV
@@ -252,7 +273,7 @@ async function startStage(stageId, { compound, assists, champ }) {
     ui.hideAll();
     ui.showHUD(true);
     if (isTouch) { ui.setTouch?.(true); ui.setTouchLayout?.(settings.touchLayout); wireTouchButtons(); }
-    ui.showMessage?.(`${stage.meta.flag} ${stage.meta.name.toUpperCase()} · ${(stage.length / 1000).toFixed(2)} KM`, 2500);
+    ui.showMessage?.(`${stage.meta.flag} ${stage.meta.name.toUpperCase()} ? ${(stage.length / 1000).toFixed(2)} KM`, 2500);
     if (settings.codriver) audio.codriver(`${stage.meta.name}. ${notes[0] ? notes[0].text : ''}`);
     G.codriver.calledUpTo = 0;
   } catch (e) {
@@ -364,20 +385,24 @@ function updateCamera(dt) {
   }
   if (!G.camInit) { cam.yaw = target; }
   let dy = target - cam.yaw; while (dy > Math.PI) dy -= 2 * Math.PI; while (dy < -Math.PI) dy += 2 * Math.PI;
-  cam.yaw += dy * Math.min(1, dt * (far ? 3.5 : 4.5));
+  cam.yaw += dy * (1 - Math.exp(-dt * (far ? 3.5 : 4.5)));
   const cx = car.pos.x + Math.sin(cam.yaw) * dist, cz = car.pos.z + Math.cos(cam.yaw) * dist;
   let cy = car.pos.y + height;
   const g = st.heightAt(cx, cz, car.roadHint) + 0.6;
   if (cy < g) cy = g;
   const desired = _b.set(cx, cy, cz);
+  // frame-rate independent exponential smoothing (the old min(1, dt*k) form behaved differently at 30 vs 120 fps)
   if (!G.camInit) cam.pos.copy(desired); else {
-    cam.pos.x += (desired.x - cam.pos.x) * Math.min(1, dt * 12);
-    cam.pos.z += (desired.z - cam.pos.z) * Math.min(1, dt * 12);
-    cam.pos.y += (desired.y - cam.pos.y) * Math.min(1, dt * 6);
+    const kxz = 1 - Math.exp(-dt * 12), ky = 1 - Math.exp(-dt * 6);
+    cam.pos.x += (desired.x - cam.pos.x) * kxz;
+    cam.pos.z += (desired.z - cam.pos.z) * kxz;
+    cam.pos.y += (desired.y - cam.pos.y) * ky;
   }
-  if (cam.pos.y < g) cam.pos.y = g;
+  // soft ground clamp: g already sits 0.6 m above the (noisy) verge terrain, so allow a small dip instead of
+  // snapping the camera up every time it passes over a bump in the ditch
+  if (cam.pos.y < g - 0.35) cam.pos.y = g - 0.35;
   const look = _c.set(car.pos.x - Math.sin(cam.yaw) * 4, car.pos.y + 0.75, car.pos.z - Math.cos(cam.yaw) * 4);
-  if (!G.camInit) cam.look.copy(look); else cam.look.lerp(look, Math.min(1, dt * 14));
+  if (!G.camInit) cam.look.copy(look); else cam.look.lerp(look, 1 - Math.exp(-dt * 14));
   camera.position.copy(cam.pos);
   // shake: rough surfaces, landings, impacts
   const rough = (SURFACES[car.wheels[0].surface]?.bump || 0) * spd * 0.03;
@@ -390,7 +415,7 @@ function updateCamera(dt) {
   camera.lookAt(cam.look);
   const baseFov = innerWidth < innerHeight ? 78 : 62;
   const fov = baseFov + Math.min(14, Math.max(0, spd - 15) * 0.18);
-  if (Math.abs(camera.fov - fov) > 0.05) { camera.fov += (fov - camera.fov) * Math.min(1, dt * 3); camera.updateProjectionMatrix(); }
+  if (Math.abs(camera.fov - fov) > 0.05) { camera.fov += (fov - camera.fov) * (1 - Math.exp(-dt * 3)); camera.updateProjectionMatrix(); }
   G.camInit = true;
 }
 
@@ -500,7 +525,7 @@ function raceUpdate(dt) {
       if (calls.length) {
         const text = calls.map((n) => n.text).join(', ');
         if (settings.codriverVoice) audio.codriver(text, calls.some((n) => n.sev === 'hairpin' || n.sev === 'jump' || n.mods.includes('tightens')));
-        G.lastNoteText = calls.map((n) => noteShort(n)).join(' › ');
+        G.lastNoteText = calls.map((n) => noteShort(n)).join(' ? ');
       }
     }
   }
@@ -538,7 +563,7 @@ function raceUpdate(dt) {
 }
 
 // ---------- main loop ----------
-let last = performance.now(), fpsAcc = 0, fpsN = 0, autoQ = { t: 0, frames: 0, slow: 0 };
+let last = performance.now(), fpsAcc = 0, fpsN = 0;
 // ---------- fixed-step physics ----------
 const PHYS_STEP = 1 / 120;
 const _physPos = new THREE.Vector3(), _physQuat = new THREE.Quaternion();
@@ -557,8 +582,13 @@ function stepCar(dt) {
 function snapInterp() { if (G.car && G.prevPos) { G.prevPos.copy(G.car.pos); G.prevQuat.copy(G.car.quat); } }
 function frame(now) {
   requestAnimationFrame(frame);
-  let dt = (now - last) / 1000; last = now;
+  let dt = (now - last) / 1000;
   if (dt > 0.1) dt = 0.1;
+  // frame cap: on a high-refresh screen the GPU can't keep up with, render every other vsync (steady 60)
+  // instead of flip-flopping between 120 and 60 fps, which reads as the car stuttering
+  if (dyn.cap && dt < dyn.cap - 0.004 && G.mode !== 'menu') return;
+  last = now;
+  const cpu0 = performance.now();
   if (G.mode === 'countdown' || G.mode === 'racing' || G.mode === 'finished') {
     if (G.mode === 'finished') {
       // coast to a stop after the flying finish
@@ -577,15 +607,34 @@ function frame(now) {
     G.world.update(dt, camera, car.pos);
     renderer.render(G.scene, camera);
     car.pos.copy(_physPos); car.quat.copy(_physQuat);
-    // auto quality: drop a tier if we're consistently slow
-    if (settings.quality === 'auto') {
-      autoQ.t += dt; autoQ.frames++; if (dt > 1 / 40) autoQ.slow++;
-      if (autoQ.t > 4) {
-        if (autoQ.slow / autoQ.frames > 0.4) {
-          const cur = qualityLevel(); const nq = cur === 'high' ? 'med' : 'low';
-          if (nq !== cur) { settings.quality = nq; applyQuality(); G.world.setQuality?.(nq); settings.quality = 'auto'; G.autoQuality = nq; }
-        }
-        autoQ.t = 0; autoQ.frames = 0; autoQ.slow = 0;
+    // auto quality = dynamic resolution (never toggles shadows/materials mid-stage -> no recompile stalls)
+    // target: every frame on time for the display (or for the 60 fps cap). Measure the refresh period from the
+    // fastest recent frames, count missed frames per half-second window, and scale resolution to fix misses.
+    if (settings.quality === 'auto' && dt < 0.25) {
+      dyn.minDt = Math.min(dyn.minDt * 1.002, dt);
+      const period = Math.max(dyn.cap, dyn.minDt);
+      dyn.t += dt; dyn.n++; dyn.sum = (dyn.sum || 0) + dt; if (dt > period * 1.45) dyn.miss++;
+      dyn.cpu = (dyn.cpu || 0) + (performance.now() - cpu0) / 1000; // JS-side frame work (physics, fx, draw submission)
+      if (dyn.t >= 0.5) {
+        const rate = dyn.miss / dyn.n;
+        dyn.hold = Math.max(0, dyn.hold - dyn.t);
+        if (rate > 0.12) {
+          dyn.good = 0;
+          if (++dyn.bad >= 2) {
+            dyn.bad = 0; dyn.hold = 5;
+            // high-refresh screen that can't hold it: lock a steady 60 first (keeps resolution), then scale.
+            // one sized jump (pixel count ~ GPU time) instead of many small steps: every resize is a small hitch
+            if (!dyn.cap && dyn.minDt < 1 / 100) dyn.cap = 1 / 60; // 120/144 Hz only (90 Hz halved would be 45)
+            else if (dyn.cpu / dyn.n > Math.max(dyn.cap, dyn.minDt) * 0.8) { /* CPU-bound: fewer pixels won't help, keep the resolution */ }
+            else { const avg = dyn.sum / dyn.n, tgt = Math.max(dyn.cap, dyn.minDt); setRenderScale(dyn.scale * Math.min(0.92, Math.max(0.6, Math.sqrt(tgt / avg) * 0.92))); }
+          }
+        } else if (rate < 0.02) {
+          dyn.bad = 0;
+          if (++dyn.good >= 16 && dyn.hold <= 0 && dyn.scale < 1) { setRenderScale(dyn.scale * 1.06); dyn.good = 0; } // creep back up slowly (8 s of clean frames)
+        } else { dyn.bad = 0; dyn.good = 0; }
+        G.autoQuality = Math.round(dyn.scale * 100) + '%' + (dyn.cap ? '@60' : '');
+        if ((dyn.saved += dyn.t) > 3) { dyn.saved = 0; saveDyn(); }
+        dyn.t = 0; dyn.n = 0; dyn.miss = 0; dyn.sum = 0; dyn.cpu = 0;
       }
     }
   } else if (G.mode === 'paused') {
@@ -619,7 +668,7 @@ qualityLevel; // keep
     goMainMenu();
     requestAnimationFrame(frame);
     // debug hooks
-    window.RL = { G, settings, startStage, goMainMenu, input, audio };
+    window.RL = { G, settings, startStage, goMainMenu, input, audio, camera, renderer };
     // ?bot=1 : simple autopilot for automated testing
     if (new URLSearchParams(location.search).get('bot')) {
       const botTick = () => {

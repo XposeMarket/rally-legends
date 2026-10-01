@@ -63,6 +63,12 @@ export class RallyAudio {
       this.ready = true;
       if (this._carSpec && !this.car) this.setCar(this._carSpec);
       this._pickVoice();
+      // warm up the speech engine inside the user gesture: the very first speak() call can block the main thread
+      // for a noticeable moment on some browsers, which used to land right as the first pace note was called
+      if (!this._speechWarm && typeof speechSynthesis !== 'undefined' && typeof SpeechSynthesisUtterance !== 'undefined') {
+        this._speechWarm = true;
+        try { const u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); } catch (_) {}
+      }
       return true;
     } catch (e) { console.warn('[audio] unlock failed', e); return false; }
   }

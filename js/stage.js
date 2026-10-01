@@ -128,7 +128,9 @@ export class Stage {
   nearest(x, z, hint = -1, out = this._q) {
     const q = { d2: Infinity, i: 0, t: 0, cx: 0, cz: 0 };
     if (hint >= 0) {
-      const a = Math.max(0, hint - 25), b = Math.min(this.N - 2, hint + 25);
+      // the hint is from the previous 120 Hz step (< 1 m ago) and segments are ~4 m: +-8 is plenty, and the
+      // edge check below still falls back to the global search if we ever leave the window
+      const a = Math.max(0, hint - 8), b = Math.min(this.N - 2, hint + 8);
       for (let i = a; i <= b; i++) this._projSeg(i, x, z, q);
       if (q.d2 > 30 * 30 || q.i === a && a > 0 || q.i === b && b < this.N - 2) q.d2 = Infinity; // fall back to global
     }
