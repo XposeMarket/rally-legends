@@ -172,8 +172,18 @@ export class Car {
     const rpmIn = (g) => Math.abs(wheelRpm * s.gears[g - 1] * s.finalDrive);
     const r = rpmIn(this.gear);
     this._sinceShift = (this._sinceShift || 0) + dt;
-    // upshift at the redline (actual engine rpm, so a car spinning its wheels still changes up like a driver would)
-    if (this.gear < s.gears.length && this.engine.rpm > e.redline * 0.985 && inp.throttle > 0.3 && this.engine.clutch >= 1 && this._sinceShift > 0.35) { this.shiftTarget = this.gear + 1; this._beginShift(); this._sinceShift = 0; return; }
+    // Upshift at the redline. While the car is sliding or the driven wheels are spinning, a rally driver HOLDS the
+    // gear and rides the limiter so the throttle keeps steering the rear: only change up when road speed itself
+    // needs the next gear.
+    const groundRpm = Math.abs(groundOmega * s.gears[this.gear - 1] * s.finalDrive) * 60 / (2 * Math.PI);
+    // sideways: fewer upshifts (each one is a torque gap mid-drift) and NO downshifts (a downshift mid-slide
+    // over-revs the driven wheels, kills rear grip and spins the car)
+    const sideways = Math.abs(this.slideAngle || 0) > 0.17 && Math.abs(fwdSpeed) > 5;
+    this._sideT = sideways ? 0.6 : Math.max(0, (this._sideT || 0) - dt); // stays 'sliding' briefly after the slide
+    const sliding = this._sideT > 0;
+    void groundRpm;
+    if (this.gear < s.gears.length && this.engine.rpm > e.redline * 0.985 && inp.throttle > 0.3 && this.engine.clutch >= 1 && this._sinceShift > (sliding ? 0.7 : 0.35)) { this.shiftTarget = this.gear + 1; this._beginShift(); this._sinceShift = 0; return; }
+    if (sliding && !(inp.brake > 0.3 && this.engine.rpm < e.redline * 0.45)) return;
     if (this.gear > 1 && this._sinceShift > 0.8) {
       const lower = rpmIn(this.gear - 1);
       const braking = inp.brake > 0.2 || inp.throttle < 0.1;
@@ -182,8 +192,11 @@ export class Car {
   }
 
   // ---------- main step ----------
-  update(dt) {
-    this.shiftedThisFrame = false; this.engine.antilagPop = false; this.suspHit = 0; this.impacts.length = 0;
+  // reset per-render-frame events (impacts, pops, shifts). The game calls this once per frame and then runs
+  // several fixed physics steps with update(step, true) so no events are lost between steps.
+  beginFrame() { this.shiftedThisFrame = false; this.engine.antilagPop = false; this.suspHit = 0; this.impacts.length = 0; }
+  update(dt, keepEvents = false) {
+    if (!keepEvents) this.beginFrame();
     const n = this.sub, h = dt / n;
     for (let k = 0; k < n; k++) this._substep(h);
     // road tracking
@@ -219,7 +232,8 @@ export class Car {
     this.slideAngle = slide;
     const speedLock = 1 / (1 + Math.max(0, fwdSpeed - 8) / (assist > 0 ? 38 : 70));
     let target = inp.steer * s.steerLock * speedLock + this.damage.steering * 0.06;
-    if (assist > 0 && spd > 5) target += clamp(slide * 0.9 * assist, -0.35, 0.35) * (1 - Math.abs(inp.steer) * 0.5);
+    // countersteer assist only helps when the player isn't steering; it must never fight a deliberate drift
+    if (assist > 0 && spd > 5) target += clamp(slide * 0.8 * assist, -0.3, 0.3) * (1 - Math.abs(inp.steer) * 0.6);
     target = clamp(target, -s.steerLock, s.steerLock);
     const rate = 2.8 + 2.5 * (1 - speedLock); // rad/s at the wheels
     this.steerSmooth += clamp(target - this.steerSmooth, -rate * h, rate * h);
@@ -234,7 +248,13 @@ export class Car {
     if (this.shiftTimer > 0) { this.shiftTimer -= h; if (this.shiftTimer <= 0) { this.gear = this._pendingGear; this.shiftTimer = 0; } }
     const driven = this.wheels.filter((w) => (s.drivetrain === 'AWD') || (s.drivetrain === 'FWD' ? w.front : !w.front));
     // mean driven wheel angular velocity, weighted by torque share
-    const cf = s.drivetrain === 'AWD' ? s.diff.centerFront : s.drivetrain === 'FWD' ? 1 : 0;
+    // AWD: rear-biased split that shifts further rearward when sideways on throttle (active/viscous centre diffs
+    // feeding the rear axle) so the throttle steers the car in a slide instead of pulling the nose straight
+    let cf = s.drivetrain === 'AWD' ? s.diff.centerFront : s.drivetrain === 'FWD' ? 1 : 0;
+    if (s.drivetrain === 'AWD') {
+      const sl = clamp(Math.abs(this.slideAngle || 0) / 0.35, 0, 1) * clamp(inp.throttle, 0, 1);
+      cf = cf * (0.9 - 0.8 * sl); // e.g. 47% front -> 42% normally, ~5% fully sideways at full throttle
+    }
     const wf = (this.wheels[0].omega + this.wheels[1].omega) / 2, wr = (this.wheels[2].omega + this.wheels[3].omega) / 2;
     this._drivenOmega = s.drivetrain === 'AWD' ? wf * cf + wr * (1 - cf) : s.drivetrain === 'FWD' ? wf : wr;
     if (this.assists.autoGear) this._autoGearbox(h);
@@ -245,11 +265,11 @@ export class Car {
     // turbo boost model
     if (e.turbo) {
       const want = clamp(throttle * clamp((eng.rpm - 2200) / 2000, 0, 1), 0, 1);
-      const lagT = e.antilag ? 0.18 : 0.45;
+      const lagT = e.antilag ? 0.15 : 0.3;
       const target2 = e.antilag && eng.rpm > 3000 ? Math.max(want, 0.7) : want;
       eng.boost += (target2 - eng.boost) * Math.min(1, h / lagT);
     } else eng.boost = throttle;
-    const boostMul = e.turbo ? 0.5 + 0.5 * eng.boost : 1;
+    const boostMul = e.turbo ? 0.62 + 0.38 * eng.boost : 1;
     const hybrid = e.hybrid && throttle > 0.5 && fwdSpeed > 3 ? 1.12 : 1;
     const limiterCut = clamp((e.limiter - eng.rpm) / 120, 0, 1); // soft-cut limiter (no torque chatter)
     let Te = torqueCurve(e.curve, eng.rpm) * throttle * boostMul * hybrid * limiterCut * (1 - 0.45 * this.damage.engine);
@@ -302,8 +322,9 @@ export class Car {
       const split = hbOn ? 1 : cf;
       Tf = driveTotal * split; Tr = driveTotal * (1 - split);
       if (!hbOn) {
-        const kc = s.diff.center === 'locked' ? 260 : s.diff.center === 'active' ? 140 : s.diff.center === 'lsd' ? 90 : 45;
-        const cap = Math.abs(driveTotal) * 0.6 + 350;
+        // centre coupling: loose enough that the rear axle can be spun up on throttle (power oversteer)
+        const kc = s.diff.center === 'locked' ? 200 : s.diff.center === 'active' ? 55 : s.diff.center === 'lsd' ? 45 : 28;
+        const cap = Math.abs(driveTotal) * 0.3 + 120;
         const lock = clamp(kc * (wf - wr), -cap, cap);
         Tf -= lock; Tr += lock;
       }

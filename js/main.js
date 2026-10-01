@@ -223,7 +223,7 @@ async function startStage(stageId, { compound, assists, champ }) {
     ui.setLoading?.(0.8, 'Preparing car');
     await new Promise((r) => setTimeout(r, 20));
     const spec = carById(profile.selectedCar);
-    const car = new Car(spec, stage, { compound, assists, colliders: world.colliders || [] });
+    const car = new Car(spec, stage, { compound, assists, colliders: world.colliders || [], substeps: 2 });
     car.noDamage = !settings.damage;
     car.placeAtS(stage.startS - 8);
     for (let i = 0; i < 40; i++) car.update(1 / 60); // settle on suspension
@@ -240,8 +240,10 @@ async function startStage(stageId, { compound, assists, champ }) {
       raceTime: 0, penalty: 0, splits: [], splitIdx: 0, countdown: 3.999, mode: 'countdown', champ: !!champ,
       offTimer: 0, wrongWayT: 0, recovering: 0, compound, lastNoteText: '', camInit: false, lastCount: 4,
       rivals: rivalField(meta || stage.meta, G.difficulty, CARS.map((c) => c.id)), best: records[stageId] || null,
-      dirt: 0, finishedAt: 0,
+      dirt: 0, finishedAt: 0, prevPos: car.pos.clone(), prevQuat: car.quat.clone(), physAcc: 0, physAlpha: 0,
     });
+    // pre-compile every shader now (incl. the exhaust flame sprite) so nothing compiles mid-stage
+    try { model.flame?.(); syncCarPose(model, car); renderer.compile(scene, camera); } catch (e) { console.warn('precompile', e); }
     if (world.isNight && world.hemi) world.hemi.intensity = Math.max(world.hemi.intensity, 0.4);
     ui.setHudOptions?.({ showPaceNotes: settings.showPaceNotes, damage: settings.damage, splits: stage.splitS.map((s) => (s - stage.startS) / (stage.finishS - stage.startS)) });
     model.setLights?.({ head: world.isNight || stage.meta.env === 'city_dusk' || stage.meta.env === 'wales_overcast', brake: 0, reverse: false });
@@ -272,7 +274,7 @@ const CAMS = ['chase', 'chase_far', 'bumper', 'bonnet', 'cockpit'];
 function cycleCamera() { G.camMode = CAMS[(CAMS.indexOf(G.camMode) + 1) % CAMS.length]; settings.camera = G.camMode; LS.set('settings', settings); ui.toast?.('Camera: ' + G.camMode.replace('_', ' ')); }
 function doRecover() {
   if (!G.car || G.mode !== 'racing') return;
-  G.penalty += G.car.recover(); G.recovering = 1.2;
+  G.penalty += G.car.recover(); G.recovering = 1.2; snapInterp();
   if (ui.showPenalty) ui.showPenalty(5); else ui.toast?.('Recovered +5.0s');
   audio.ui?.('penalty');
 }
@@ -380,7 +382,11 @@ function updateCamera(dt) {
   // shake: rough surfaces, landings, impacts
   const rough = (SURFACES[car.wheels[0].surface]?.bump || 0) * spd * 0.03;
   cam.shake = Math.max(cam.shake * Math.exp(-dt * 6), car.suspHit * 0.25, rough);
-  if (cam.shake > 0.001) { camera.position.x += (Math.random() - 0.5) * cam.shake * 0.3; camera.position.y += (Math.random() - 0.5) * cam.shake * 0.3; }
+  if (cam.shake > 0.001) { // smooth (band-limited) shake, not per-frame random jitter
+    const tt = performance.now() / 1000;
+    camera.position.x += (Math.sin(tt * 29.3) + Math.sin(tt * 17.1 + 1.3)) * 0.5 * cam.shake * 0.16;
+    camera.position.y += (Math.sin(tt * 23.7 + 0.4) + Math.sin(tt * 13.9 + 2.1)) * 0.5 * cam.shake * 0.16;
+  }
   camera.lookAt(cam.look);
   const baseFov = innerWidth < innerHeight ? 78 : 62;
   const fov = baseFov + Math.min(14, Math.max(0, spd - 15) * 0.18);
@@ -391,6 +397,10 @@ function updateCamera(dt) {
 // ---------- sync visuals from physics ----------
 const _p = new THREE.Vector3(), _n = new THREE.Vector3(), _vel = new THREE.Vector3();
 let lastLights = '';
+function syncCarPose(m, car) {
+  m.group.quaternion.copy(car.quat);
+  m.group.position.set(0, -car.cgY, -car.cgZ).applyQuaternion(car.quat).add(car.pos);
+}
 function syncCar(dt) {
   const car = G.car, m = G.model;
   // model origin = CG + q*(0,-cgY,-cgZ)
@@ -456,10 +466,13 @@ function raceUpdate(dt) {
     car.input.steer = 0; car.input.throttle = inp.throttle; car.input.brake = 1; car.input.handbrake = 1;
     if (G.countdown <= 0) { G.mode = 'racing'; G.raceTime = 0; }
   } else {
-    car.input.steer = inp.steer; car.input.throttle = inp.throttle; car.input.brake = inp.brake; car.input.handbrake = inp.handbrake;
+    // throttle ramps in over ~0.15 s (digital keys / touch buttons would otherwise slam full torque on instantly)
+    const thrIn = inp.throttle, thrPrev = car.input.throttle || 0;
+    const thr = thrIn > thrPrev ? Math.min(thrIn, thrPrev + dt * 7) : Math.max(thrIn, thrPrev - dt * 12);
+    car.input.steer = inp.steer; car.input.throttle = thr; car.input.brake = inp.brake; car.input.handbrake = inp.handbrake;
     if (G.recovering > 0) { G.recovering -= dt; car.input.throttle *= 0.3; }
   }
-  car.update(Math.min(dt, 1 / 30));
+  stepCar(dt);
   if (car.needsRecover && G.mode === 'racing') { car.needsRecover = false; doRecover(); }
   else car.needsRecover = false;
   const q = car.roadQ;
@@ -526,6 +539,22 @@ function raceUpdate(dt) {
 
 // ---------- main loop ----------
 let last = performance.now(), fpsAcc = 0, fpsN = 0, autoQ = { t: 0, frames: 0, slow: 0 };
+// ---------- fixed-step physics ----------
+const PHYS_STEP = 1 / 120;
+const _physPos = new THREE.Vector3(), _physQuat = new THREE.Quaternion();
+function stepCar(dt) {
+  const car = G.car;
+  if (!G.prevPos) { G.prevPos = car.pos.clone(); G.prevQuat = car.quat.clone(); }
+  car.beginFrame();
+  G.physAcc = Math.min((G.physAcc || 0) + dt, PHYS_STEP * 12);
+  while (G.physAcc >= PHYS_STEP) {
+    G.prevPos.copy(car.pos); G.prevQuat.copy(car.quat);
+    car.update(PHYS_STEP, true);
+    G.physAcc -= PHYS_STEP;
+  }
+  G.physAlpha = G.physAcc / PHYS_STEP;
+}
+function snapInterp() { if (G.car && G.prevPos) { G.prevPos.copy(G.car.pos); G.prevQuat.copy(G.car.quat); } }
 function frame(now) {
   requestAnimationFrame(frame);
   let dt = (now - last) / 1000; last = now;
@@ -534,15 +563,20 @@ function frame(now) {
     if (G.mode === 'finished') {
       // coast to a stop after the flying finish
       G.car.input.throttle = 0; G.car.input.brake = 0.6; G.car.input.handbrake = 0; G.car.input.steer *= 0.9;
-      G.car.update(dt); G.car.telemetry(tel);
+      stepCar(dt); G.car.telemetry(tel);
       audio.update(dt, { rpm: tel.rpm, throttle: 0, load: -0.5, gear: tel.gear, speed: tel.speed, turboBoost: 0, antilagPop: tel.antilagPop, shift: false, wheelSlip: tel.wheelSlip, surface: tel.surface, onGround: tel.onGround, suspHit: 0, camInside: false, paused: false });
     } else raceUpdate(dt);
     if (!G.scene) { input.endFrame(); return; }
+    // render the car at an interpolated pose between the last two fixed physics steps (smooth at any frame rate)
+    const car = G.car;
+    _physPos.copy(car.pos); _physQuat.copy(car.quat);
+    if (G.prevPos) { car.pos.lerpVectors(G.prevPos, _physPos, G.physAlpha || 0); car.quat.slerpQuaternions(G.prevQuat, _physQuat, G.physAlpha || 0); }
     syncCar(dt);
     G.fx.update(dt, camera);
     updateCamera(dt);
-    G.world.update(dt, camera, G.car.pos);
+    G.world.update(dt, camera, car.pos);
     renderer.render(G.scene, camera);
+    car.pos.copy(_physPos); car.quat.copy(_physQuat);
     // auto quality: drop a tier if we're consistently slow
     if (settings.quality === 'auto') {
       autoQ.t += dt; autoQ.frames++; if (dt > 1 / 40) autoQ.slow++;

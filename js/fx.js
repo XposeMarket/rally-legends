@@ -44,10 +44,13 @@ class Pool {
     geo.setAttribute('position', this.aPos); geo.setAttribute('color', this.aCol); geo.setAttribute('alpha', this.aAlpha); geo.setAttribute('size', this.aSize);
     geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e7);
     this.mat = new THREE.ShaderMaterial({
-      uniforms: { map: { value: tex }, scale: { value: 600 } },
-      vertexShader: `attribute float alpha; attribute float size; attribute vec3 color; varying float vA; varying vec3 vC; uniform float scale;
-        void main(){ vA = alpha; vC = color; vec4 mv = modelViewMatrix * vec4(position,1.0); gl_Position = projectionMatrix * mv;
-        gl_PointSize = alpha > 0.001 ? clamp(size * scale / -mv.z, 1.0, 512.0) : 0.0; }`,
+      uniforms: { map: { value: tex }, scale: { value: 600 }, maxPx: { value: 256 } },
+      // near-camera fade + screen-size cap: big smoke puffs right in front of the lens are what kill the GPU
+      // (hundreds of full-screen overdraw layers), and they look bad anyway
+      vertexShader: `attribute float alpha; attribute float size; attribute vec3 color; varying float vA; varying vec3 vC; uniform float scale; uniform float maxPx;
+        void main(){ vec4 mv = modelViewMatrix * vec4(position,1.0); float d = -mv.z; vC = color;
+        vA = alpha * smoothstep(0.9, 4.0, d); gl_Position = projectionMatrix * mv;
+        gl_PointSize = vA > 0.004 ? clamp(size * scale / max(d, 0.1), 1.0, maxPx) : 0.0; }`,
       fragmentShader: `uniform sampler2D map; varying float vA; varying vec3 vC;
         void main(){ vec4 t = texture2D(map, gl_PointCoord); float a = t.a * vA; if (a < 0.01) discard; gl_FragColor = vec4(vC * ${additive ? 'a' : '1.0'}, a); 
         #include <colorspace_fragment>
@@ -142,7 +145,8 @@ const rnd = (a, b) => a + Math.random() * (b - a);
 export class RallyFX {
   constructor(scene, { quality = 'high' } = {}) {
     this.scene = scene; this.hi = quality !== 'low';
-    const total = this.hi ? 4000 : 1200;
+    this.qf = quality === 'high' ? 1 : quality === 'med' ? 0.55 : 0.35; // emission scale per quality tier
+    const total = quality === 'high' ? 4000 : quality === 'med' ? 2200 : 1200;
     this.tex = softSprite();
     this.chunkTex = (() => { const c = document.createElement('canvas'); c.width = c.height = 32; const g = c.getContext('2d'); g.fillStyle = '#fff'; g.beginPath(); g.moveTo(8, 4); g.lineTo(26, 9); g.lineTo(28, 24); g.lineTo(12, 28); g.lineTo(4, 16); g.fill(); return new THREE.CanvasTexture(c); })();
     this.dust = new Pool(scene, Math.floor(total * 0.55), this.tex, false);
@@ -155,15 +159,15 @@ export class RallyFX {
   _emitN(slot, rate, dt) { this.acc[slot] += rate * dt; const n = Math.floor(this.acc[slot]); this.acc[slot] -= n; return Math.min(n, 40); }
   emitWheel(i, pos, vel, slip, surface, speed, dt) {
     const S = SURF[surface] || SURF.gravel;
-    const q = this.hi ? 1 : 0.4;
+    const q = this.qf;
     const energy = Math.min(3, Math.max(0, slip) * Math.min(speed, 40) / 10 + Math.min(speed, 40) / 40 * 0.4); // roost ~ slip*speed
     const vx = vel ? vel.x : 0, vy = vel ? vel.y : 0, vz = vel ? vel.z : 0;
     const vl = Math.hypot(vx, vz) || 1, bx = -vx / vl, bz = -vz / vl; // backward direction
     this.dust.curFloor = this.chunks.curFloor = pos.y;
     if (S.smoke) {
       if (slip > 0.3) {
-        const n = this._emitN(i * 3 + 2, Math.min(1.5, slip - 0.3) * 22 * q, dt);
-        for (let k = 0; k < n; k++) this.dust.spawn(pos.x + rnd(-0.15, 0.15), pos.y + 0.15, pos.z + rnd(-0.15, 0.15), vx * 0.25 + rnd(-0.6, 0.6), rnd(0.4, 1.2), vz * 0.25 + rnd(-0.6, 0.6), S.dust, rnd(0.7, 1.1), 3.5, S.life * rnd(0.7, 1.2), 0.32, 1.2, -0.25);
+        const n = this._emitN(i * 3 + 2, Math.min(1.2, slip - 0.3) * 16 * q, dt);
+        for (let k = 0; k < n; k++) this.dust.spawn(pos.x + rnd(-0.15, 0.15), pos.y + 0.15, pos.z + rnd(-0.15, 0.15), vx * 0.25 + rnd(-0.6, 0.6), rnd(0.4, 1.2), vz * 0.25 + rnd(-0.6, 0.6), S.dust, rnd(0.6, 0.95), 2.6, S.life * rnd(0.6, 1.0), 0.36, 1.2, -0.25);
       }
       if (!S.d) return;
     }
@@ -232,6 +236,8 @@ export class RallyFX {
     if (camera && camera.isPerspectiveCamera) {
       const h = (window.innerHeight || 720) * (window.devicePixelRatio || 1) / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2));
       this.dust.mat.uniforms.scale.value = this.chunks.mat.uniforms.scale.value = this.glow.mat.uniforms.scale.value = h;
+      const maxPx = Math.max(96, (window.innerHeight || 720) * (window.devicePixelRatio || 1) * 0.3);
+      this.dust.mat.uniforms.maxPx.value = this.chunks.mat.uniforms.maxPx.value = this.glow.mat.uniforms.maxPx.value = maxPx;
     }
     this.dust.update(dt); this.chunks.update(dt); this.glow.update(dt); this.skids.flush();
   }
