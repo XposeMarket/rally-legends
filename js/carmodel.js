@@ -197,7 +197,7 @@ function patchMaterial(mat, U) {
       dm = max(dm, uDirt * 0.25);
       diffuseColor.rgb = mix(diffuseColor.rgb, uDirtCol, clamp(dm, 0.0, 0.92));
       float sc = step(0.82, fract(sin(dot(floor(vLP.xz * 40.0 + vLP.y * 13.0), vec2(12.9898, 78.233))) * 43758.5453));
-      diffuseColor.rgb *= 1.0 - uDamage * (0.25 + 0.35 * sc);`);
+      diffuseColor.rgb *= 1.0 - uDamage * (0.18 + 0.12 * sc);`);
   };
   mat.customProgramCacheKey = () => 'rlbody';
   return mat;

@@ -242,6 +242,8 @@ async function startStage(stageId, { compound, assists, champ }) {
       rivals: rivalField(meta || stage.meta, G.difficulty, CARS.map((c) => c.id)), best: records[stageId] || null,
       dirt: 0, finishedAt: 0,
     });
+    if (world.isNight && world.hemi) world.hemi.intensity = Math.max(world.hemi.intensity, 0.4);
+    ui.setHudOptions?.({ showPaceNotes: settings.showPaceNotes, damage: settings.damage, splits: stage.splitS.map((s) => (s - stage.startS) / (stage.finishS - stage.startS)) });
     model.setLights?.({ head: world.isNight || stage.meta.env === 'city_dusk' || stage.meta.env === 'wales_overcast', brake: 0, reverse: false });
     audio.setCar(spec); audio.setVolume(settings.volume);
     ui.setLoading?.(1, '');
@@ -271,7 +273,8 @@ function cycleCamera() { G.camMode = CAMS[(CAMS.indexOf(G.camMode) + 1) % CAMS.l
 function doRecover() {
   if (!G.car || G.mode !== 'racing') return;
   G.penalty += G.car.recover(); G.recovering = 1.2;
-  ui.toast?.('Recovered +5.0s'); audio.ui?.('penalty');
+  if (ui.showPenalty) ui.showPenalty(5); else ui.toast?.('Recovered +5.0s');
+  audio.ui?.('penalty');
 }
 function pauseGame() {
   if (G.mode !== 'racing' && G.mode !== 'countdown') return;
@@ -413,7 +416,8 @@ function syncCar(dt) {
     const w = car.wheels[i];
     if (!w.contact) { fx.skidBreak(i); continue; }
     const slip = car.telemetry ? null : null;
-    const ls = Math.max(Math.abs(w.slipRatio) / 0.25, Math.abs(w.slipAngle) / 0.3) - 0.35;
+    // w.slip = combined slip normalised to the tyre's peak (1 = limit); effects start just past the limit
+    const ls = (w.slip - 0.85) * 0.8;
     _vel.copy(car.vel);
     fx.emitWheel(i, w.contactPos, _vel, Math.max(0, ls), w.surface, sp, dt);
     fx.skid(i, w.contactPos, w.normal, Math.max(0, ls), w.surface, dt);
@@ -422,7 +426,7 @@ function syncCar(dt) {
     fx.impact(im.pos, im.strength, car.wheels[0].surface);
     audio.impact(im.strength, im.kind === 'ground' ? 'ground' : im.kind === 'wall' || im.kind === 'barrier' || im.kind === 'building' ? 'barrier' : im.kind === 'rock' ? 'rock' : 'tree');
     cam.shake = Math.max(cam.shake, im.strength * 0.6);
-    if (im.strength > 0.3 && navigator.vibrate) navigator.vibrate(Math.round(30 + im.strength * 60));
+    if (im.strength > 0.3 && navigator.vibrate && navigator.userActivation?.hasBeenActive) navigator.vibrate(Math.round(30 + im.strength * 60));
   }
   if (car.engine.antilagPop && m.exhaust) {
     m.flame?.();
@@ -436,6 +440,7 @@ const tel = {};
 const hud = { nextNotes: [], damageParts: {} };
 function noteIcon(n) { return { dir: n.dir, sev: n.sev }; }
 function raceUpdate(dt) {
+  input.touchState = ui.touchEnabled ? ui.touchState : null;
   const car = G.car, st = G.stage, inp = input.poll(dt, settings.steerSensitivity);
   if (input.was('Escape') || input.was('KeyP') || input.was('Pause')) { pauseGame(); return; }
   if (input.was('KeyC')) cycleCamera();
@@ -493,7 +498,7 @@ function raceUpdate(dt) {
     antilagPop: tel.antilagPop, shift: tel.shift, wheelSlip: tel.wheelSlip, surface: tel.surface, onGround: tel.onGround,
     suspHit: tel.suspHit, camInside: G.camMode === 'cockpit' || G.camMode === 'bonnet', paused: false,
   });
-  if (navigator.vibrate && tel.suspHit > 0.5) navigator.vibrate(40);
+  if (navigator.vibrate && tel.suspHit > 0.5 && navigator.userActivation?.hasBeenActive) navigator.vibrate(40);
   // HUD
   const upcoming = G.codriver.upcoming(q.s, 3);
   hud.nextNotes.length = 0;
@@ -581,6 +586,23 @@ qualityLevel; // keep
     requestAnimationFrame(frame);
     // debug hooks
     window.RL = { G, settings, startStage, goMainMenu, input, audio };
+    // ?bot=1 : simple autopilot for automated testing
+    if (new URLSearchParams(location.search).get('bot')) {
+      const botTick = () => {
+        const car = G.car, st = G.stage;
+        if (car && G.mode === 'racing') {
+          const q = car.roadQ, p = st.pointAtS(q.s + 8 + car.speed * 0.6), qq = car.quat;
+          const fx = -2 * (qq.x * qq.z + qq.w * qq.y), fz = -(1 - 2 * (qq.x * qq.x + qq.y * qq.y));
+          const dx = p.x - car.pos.x, dz = p.z - car.pos.z;
+          let k = 0; for (let s = q.s; s < q.s + 30 + car.speed * 2.2; s += 4) k = Math.max(k, Math.abs(st.curv[st.indexAtS(s).i]));
+          const vmax = Math.sqrt(0.7 * 9.81 / Math.max(k, 1e-3));
+          input.touchState = { steer: Math.max(-1, Math.min(1, Math.atan2(fx * dz - fz * dx, fx * dx + fz * dz) * 2.2)), throttle: car.speed < vmax ? 1 : 0, brake: car.speed > vmax * 1.1 ? 1 : 0, handbrake: 0 };
+          ui.touchState = input.touchState; ui.touchEnabled = true;
+        }
+        setTimeout(botTick, 16);
+      };
+      botTick();
+    }
     const qs = new URLSearchParams(location.search);
     if (qs.get('stage')) { profile.selectedCar = qs.get('car') || profile.selectedCar; startStage(qs.get('stage'), { compound: defaultCompound(stageIndex.find((s) => s.id === qs.get('stage'))?.surface || 'gravel'), assists: profile.assists }); }
   } catch (e) { console.error(e); document.body.insertAdjacentHTML('beforeend', `<pre style="color:#fff;position:fixed;top:0;left:0;z-index:99">${e.stack}</pre>`); }

@@ -162,7 +162,7 @@ export class RallyFX {
     this.dust.curFloor = this.chunks.curFloor = pos.y;
     if (S.smoke) {
       if (slip > 0.3) {
-        const n = this._emitN(i * 3 + 2, (slip - 0.3) * 60 * q, dt);
+        const n = this._emitN(i * 3 + 2, Math.min(1.5, slip - 0.3) * 22 * q, dt);
         for (let k = 0; k < n; k++) this.dust.spawn(pos.x + rnd(-0.15, 0.15), pos.y + 0.15, pos.z + rnd(-0.15, 0.15), vx * 0.25 + rnd(-0.6, 0.6), rnd(0.4, 1.2), vz * 0.25 + rnd(-0.6, 0.6), S.dust, rnd(0.7, 1.1), 3.5, S.life * rnd(0.7, 1.2), 0.32, 1.2, -0.25);
       }
       if (!S.d) return;
@@ -174,7 +174,7 @@ export class RallyFX {
       const up = rnd(0.5, 2.0) * (surface === 'snow' || surface === 'deepsnow' ? 1.4 : 1);
       this.dust.spawn(pos.x + rnd(-0.2, 0.2), pos.y + rnd(0.1, 0.35), pos.z + rnd(-0.2, 0.2),
         vx * 0.35 + bx * rnd(1, 3) * energy + rnd(-0.8, 0.8), up, vz * 0.35 + bz * rnd(1, 3) * energy + rnd(-0.8, 0.8),
-        S.dust, S.size * rnd(0.4, 0.7), 2.4, S.life * rnd(0.6, 1.3), surface === 'snow' || surface === 'deepsnow' ? 0.55 : 0.42, 1.0, -0.05);
+        S.dust, S.size * rnd(0.4, 0.7), 2.4, S.life * rnd(0.6, 1.3), surface === 'snow' || surface === 'deepsnow' ? 0.5 : 0.3, 1.0, -0.05);
     }
     // chunks: stones / clods / snow lumps thrown backward & up
     const cRate = S.c * Math.max(0, slip * Math.min(speed, 35) / 8 + speed / 60) * 30 * q;
