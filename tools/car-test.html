@@ -1,0 +1,92 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Rally Legends – car showroom</title>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#222;font:13px system-ui;color:#eee}#hud{position:fixed;left:10px;top:8px;background:#0008;padding:6px 10px;border-radius:6px;white-space:pre}</style>
+</head><body><div id="hud"></div>
+<script type="module">
+import * as THREE from '../js/vendor/three.module.js';
+import { CARS } from '../js/cars.js';
+import { buildCarModel } from '../js/carmodel.js';
+import { RallyFX } from '../js/fx.js';
+
+const qs = new URLSearchParams(location.search);
+const quality = qs.get('q') || 'high';
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio)); renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x8fa6bb); scene.fog = new THREE.Fog(0x8fa6bb, 30, 120);
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.05, 500);
+const hemi = new THREE.HemisphereLight(0xdfeeff, 0x6a5a48, 1.4); scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 2.6); sun.position.set(6, 10, 4); sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048); Object.assign(sun.shadow.camera, { left: -6, right: 6, top: 6, bottom: -6 }); scene.add(sun);
+// simple env for reflections
+const pm = new THREE.PMREMGenerator(renderer);
+const envScene = new THREE.Scene(); envScene.background = new THREE.Color(0x9fb4c8);
+const g1 = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshBasicMaterial({ color: 0x4a4038 })); g1.rotation.x = -Math.PI / 2; g1.position.y = -5; envScene.add(g1);
+const sk = new THREE.Mesh(new THREE.BoxGeometry(4, 1, 30), new THREE.MeshBasicMaterial({ color: 0xffffff })); sk.position.set(0, 20, 0); envScene.add(sk);
+scene.environment = pm.fromScene(envScene, 0.04).texture;
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshStandardMaterial({ color: 0x8a7a64, roughness: 1 }));
+ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.add(ground);
+
+const fx = new RallyFX(scene, { quality });
+const turntable = new THREE.Group(); scene.add(turntable);
+let idx = Math.max(0, CARS.findIndex((c) => c.id === qs.get('car')));
+let car = null, pivots = [], spec = null;
+let lights = false, dmg = 0, dirt = 0, fxMode = 0, spin = qs.get('spin') !== '0';
+function load() {
+  if (car) { car.dispose(); pivots.forEach((p) => p.removeFromParent()); }
+  spec = CARS[idx]; car = buildCarModel(spec, { quality });
+  turntable.add(car.group);
+  const D = spec.dims; pivots = [];
+  car.wheels.forEach((w, i) => {
+    const p = new THREE.Object3D();
+    const tr = (i < 2 ? D.trackF : D.trackR) / 2;
+    p.position.set(i % 2 ? tr : -tr, D.wheelR, i < 2 ? -D.wheelbase / 2 : D.wheelbase / 2);
+    p.add(w); turntable.add(p); pivots.push(p);
+  });
+  car.setDamage(dmg, new THREE.Vector3(0.3, 0, -1)); car.setDirt(dirt, 0x7a6248); car.setLights({ head: lights });
+  let tris = 0; turntable.traverse((o) => { if (o.isMesh) tris += (o.geometry.index ? o.geometry.index.count : o.geometry.attributes.position.count) / 3; });
+  hud(tris);
+}
+const FXN = ['none', 'gravel', 'snow', 'dirt(dust)', 'mud', 'tarmac smoke', 'grass'];
+const FXS = [null, 'gravel', 'snow', 'dirt', 'mud', 'tarmac', 'grass'];
+function hud(t) { document.getElementById('hud').textContent = `${spec.name}  (#${idx + 1}/${CARS.length}, ${quality}, ~${Math.round(t || 0)} tris)\n←/→ car  L lights  D damage(${dmg})  M dirt(${dirt})  1-6 fx (${FXN[fxMode]})  B backfire  I impact  W splash  Space spin`; }
+addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight') { idx = (idx + 1) % CARS.length; load(); }
+  else if (e.key === 'ArrowLeft') { idx = (idx + CARS.length - 1) % CARS.length; load(); }
+  else if (e.key === 'l' || e.key === 'L') { lights = !lights; car.setLights({ head: lights }); }
+  else if (e.key === 'd' || e.key === 'D') { dmg = dmg >= 1 ? 0 : +(dmg + 0.35).toFixed(2); dmg = Math.min(1, dmg); car.setDamage(dmg, new THREE.Vector3(0.3, 0, -1)); }
+  else if (e.key === 'm' || e.key === 'M') { dirt = dirt >= 1 ? 0 : +(dirt + 0.5).toFixed(2); car.setDirt(dirt, 0x7a6248); }
+  else if (e.key >= '0' && e.key <= '6') { fxMode = +e.key; fx.clear(); }
+  else if (e.key === 'b' || e.key === 'B') { car.flame(); const p = car.exhaust.getWorldPosition(new THREE.Vector3()); fx.backfire(p, new THREE.Vector3(0, 0, 1).applyQuaternion(turntable.quaternion)); }
+  else if (e.key === 'i' || e.key === 'I') fx.impact(new THREE.Vector3(2.5, 0.4, 0), 0.8, 'tarmac');
+  else if (e.key === 'w' || e.key === 'W') fx.splash(new THREE.Vector3(2.5, 0, 0), 0.8);
+  else if (e.key === ' ') spin = !spin;
+  hud();
+});
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+window.__setView = (yaw, dist = 7.5, h = 2.2) => { turntable.rotation.y = yaw; spin = false; camDist = dist; camH = h; };
+let camDist = 7.5, camH = 2.2; const ang = +(qs.get('yaw') || 0.7); if (qs.has('yaw')) { turntable.rotation.y = ang; }
+load();
+const clock = new THREE.Clock(); const tmp = new THREE.Vector3(), vel = new THREE.Vector3(), Nrm = new THREE.Vector3(0, 1, 0);
+let skidZ = 0;
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(0.05, clock.getDelta());
+  if (spin) turntable.rotation.y += dt * 0.35;
+  car.wheels.forEach((w, i) => { w.rotation.x -= dt * 12 / spec.dims.wheelR * 0.3; });
+  pivots[0].rotation.y = pivots[1].rotation.y = Math.sin(clock.elapsedTime * 0.8) * 0.3;
+  camera.position.set(0, camH, camDist); camera.lookAt(0, 0.55, 0);
+  if (fxMode) {
+    // emit from rear-left wheel contact as if driving forward at 20 m/s
+    pivots[2].getWorldPosition(tmp); tmp.y = 0;
+    vel.set(0, 0, -20).applyQuaternion(turntable.quaternion);
+    fx.emitWheel(2, tmp, vel, 0.8, FXS[fxMode], 20, dt);
+    skidZ += dt * 6; fx.skid(2, new THREE.Vector3(-3 + Math.sin(skidZ * 0.3) * 1.5, 0, 4 - (skidZ % 16)), Nrm, 0.8, FXS[fxMode], dt);
+    if ((skidZ % 16) < dt * 6) fx.skidBreak(2);
+  }
+  fx.update(dt, camera);
+  renderer.render(scene, camera);
+});
+window.__ready = true;
+</script></body></html>

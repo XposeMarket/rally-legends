@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#121314">
+<title>Rally Legends — UI test</title>
+<link rel="stylesheet" href="../style.css">
+<style>
+  #game { background: linear-gradient(180deg, #6d8597 0%, #a9b5ba 45%, #5b5446 46%, #3a3a33 100%); }
+  #dev { position: fixed; z-index: 200; left: 50%; bottom: 0; transform: translateX(-50%); display: flex; gap: 2px; flex-wrap: wrap; justify-content: center; max-width: 100vw; opacity: .35; }
+  #dev:hover, #dev:focus-within { opacity: 1; }
+  #dev button { font: 11px system-ui; background: #000; color: #ff0; border: 1px solid #444; padding: 4px 6px; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="ui"></div>
+<div id="boot"><div class="boot-inner"><div class="boot-mark"><span class="slash a"></span><span class="slash b"></span></div><h1 class="boot-title">RALLY <b>LEGENDS</b></h1><p class="boot-sub">Real stages. Real roads.</p><div class="boot-bar"><i id="boot-fill"></i></div><p class="boot-label" id="boot-label">Loading</p></div></div>
+<div id="dev"></div>
+<script type="module">
+const FR = new URLSearchParams(location.search).get('frame');
+if (FR) { // exact-size device frame for screenshots: ?frame=390x844&s=...
+  const [fw, fh] = FR.split('x').map(Number); const u = new URL(location.href); u.searchParams.delete('frame');
+  document.body.innerHTML = `<iframe src="${u}" style="position:fixed;left:0;top:0;width:${fw}px;height:${fh}px;border:0;z-index:999;background:#000"></iframe>`;
+  document.body.style.background = '#000';
+  throw new Error('frame mode');
+}
+import { UI } from '../js/ui.js';
+import { CARS } from '../js/cars.js';
+const stages = await (await fetch('../data/stages/index.json')).json();
+// fake previews: wiggly polylines
+stages.forEach((s, k) => { const p = []; let x = 0, z = 0, a = k; for (let i = 0; i < 160; i++) { a += Math.sin(i * 0.13 + k) * 0.25 + Math.sin(i * 0.031 * (k + 1)) * 0.12; x += Math.cos(a) * 30; z += Math.sin(a) * 30; p.push([x, z]); } s.preview = p; });
+const ui = window.ui = new UI(document.getElementById('ui'), { cars: CARS, stages });
+const P = new URLSearchParams(location.search);
+let lp = 0; const li = setInterval(() => { lp += 0.25; ui.setLoading(lp, ['Loading terrain', 'Building roads', 'Cars', 'Ready'][Math.min(3, lp * 4 - 1 | 0)]); if (lp >= 1) { clearInterval(li); ui.bootDone(); } }, P.has('s') ? 1 : 150);
+const records = { turini: { time: 312456, car: 'integrale' }, colins: { time: 298000, car: 'impreza' }, pikes: { time: 201330, car: 'rally1' } };
+let settings = { quality: 'auto', camera: 'chase', units: 'kmh', codriver: true, codriverVoice: true, volume: { master: .8, engine: .9, fx: .7, codriver: 1 }, touchLayout: 'wheel', invertTilt: false, steerSensitivity: .5, showPaceNotes: true, damage: true };
+const log = (...a) => console.log('[ui]', ...a);
+let hudRaf = 0;
+const S = {
+  menu: () => { stopHud(); ui.showMainMenu({ onQuickRace: S.stages, onChampionship: S.champ, onSettings: S.settings, onRecords: S.records, profile: { name: 'R. Driver', stagesDone: 14, records: 3, distance: 92400 } }); },
+  stages: () => ui.showStageSelect({ stages, selectedId: 'colins', records, onPick: (id) => { log('stage', id); S.cars(); }, onBack: S.menu }),
+  cars: () => ui.showCarSelect({ cars: CARS, selectedId: 'impreza', onPick: (id) => { log('car', id); S.setup(); }, onBack: S.stages }),
+  setup: () => ui.showSetup({ car: CARS[3], stage: stages[1], compounds: [{ id: 'soft', label: 'Soft' }, { id: 'hard', label: 'Hard' }, { id: 'snow', label: 'Studded' }], compound: 'snow', assists: { autoGear: true, steerAssist: .3, tcs: true, abs: false }, difficulty: 'pro', onStart: (o) => { log('start', o); S.hud(); }, onBack: S.cars }),
+  champ: () => ui.showChampionship({ events: stages.map((s, i) => ({ stageId: s.id, done: i < 3, time: 300000 + i * 4000, pos: i + 1 })), standings: [{ name: 'You', car: 'integrale', total: 912000, isPlayer: true }, { name: 'M. Mäkinen', car: 'evo6', total: 905300 }, { name: 'C. Sainz', car: 'rally1', total: 915800 }, { name: 'W. Röhrl', car: 's1e2', total: 921000 }], onContinue: S.setup, onBack: S.menu }),
+  results: () => { stopHud(); ui.showHUD(false); ui.showResults({ stage: stages[1], car: CARS[3], time: 301234, penalties: 2, splits: [98100, 201900], rivals: [{ name: 'M. Mäkinen', car: 'evo6', time: 299800 }, { name: 'You', car: 'impreza', time: 303234, isPlayer: true }, { name: 'C. McRae', car: 'impreza', time: 304120 }, { name: 'T. Mäkinen', car: 'evo6', time: 306000 }, { name: 'D. Auriol', car: 'integrale', time: 311500 }], isRecord: true, onRetry: S.hud, onNext: S.menu, onMenu: S.menu, nextLabel: 'Next Stage' }); },
+  pause: () => ui.showPause({ onResume: () => ui.hideAll(), onRestart: S.hud, onRecover: () => ui.hideAll(), onSettings: S.settings, onQuit: S.menu }),
+  settings: () => ui.showSettings({ settings, onChange: (s) => { settings = s; log('settings', s); }, onBack: S.menu }),
+  records: () => ui.showRecords({ records, stages, cars: CARS, onBack: S.menu }),
+  hud: () => { ui.hideAll(); ui.showHUD(true); startHud(); },
+  touch: () => { ui.setTouch(!ui.touchEnabled); },
+  countdown: () => { [3, 2, 1, 0].forEach((n, i) => setTimeout(() => ui.showCountdown(n), i * 1000)); },
+  split: () => ui.showSplit({ index: 0, time: 98123, delta: -1200 }),
+  toast: () => { ui.toast('Camera: Bonnet'); ui.showPenalty(5); ui.showMessage('Stage start in 10', 1500); },
+};
+const notes = [
+  { text: '3 right', icon: { dir: 'R', sev: 3 } }, { text: 'hairpin left', icon: { dir: 'L', sev: 'hairpin' } }, { text: 'crest', icon: { dir: null, sev: 'crest' } },
+  { text: '6 left', icon: { dir: 'L', sev: 6 } }, { text: 'square right', icon: { dir: 'R', sev: 'square' } }, { text: 'jump', icon: { dir: null, sev: 'jump' } }, { text: '1 left', icon: { dir: 'L', sev: 1 } }, { text: 'flat', icon: { dir: null, sev: 'flat' } },
+];
+function startHud() {
+  stopHud(); const t0 = performance.now(); ui.tilt = 0;
+  ui.touch.onPause(S.pause); ui.touch.onCamera(() => ui.toast('Camera')); ui.touch.shiftUp(() => log('up')); ui.touch.shiftDown(() => log('down'));
+  const loop = (t) => {
+    const s = (t - t0) / 1000; const rpm = 1500 + (Math.sin(s * 1.3) * .5 + .5) * 6400; const k = Math.floor(s / 2) % notes.length;
+    ui.updateHUD({ kmh: 40 + 120 * (Math.sin(s * .4) * .5 + .5) + ui.touchState.throttle * 20, units: settings.units, gear: 1 + (Math.floor(s / 3) % 6), rpm, redline: 7500, limiter: 7700, maxRpm: 8500, time: s * 1000, distance: (s * 40) % 6963, length: 6963, splitIndex: Math.floor(((s * 40) % 6963) / 2321), damage: (s % 20) / 20, damageParts: { engine: (s % 20) / 25, steering: (s % 14) / 14, suspension: [(s % 9) / 9, 0, .5, (s % 30) / 30] }, surface: 'snow', paceNote: notes[k].text, nextNotes: [notes[k], notes[(k + 1) % notes.length], notes[(k + 2) % notes.length]], penalty: s > 10 ? 5 : 0, stageName: "Colin's Crest", delta: Math.sin(s * .3) * 2500, wrongWay: s % 30 > 27, recovering: s % 30 > 24 && s % 30 < 26, boost: Math.sin(s) * .5 + .5, handbrake: ui.touchState.handbrake > 0 || s % 8 < .6 });
+    hudRaf = requestAnimationFrame(loop);
+  };
+  hudRaf = requestAnimationFrame(loop);
+}
+function stopHud() { cancelAnimationFrame(hudRaf); }
+const dev = document.getElementById('dev');
+for (const k of Object.keys(S)) { const b = document.createElement('button'); b.textContent = k; b.onclick = S[k]; dev.appendChild(b); }
+addEventListener('keydown', (e) => { if (e.key === 'Escape') { if (!ui.back() && ui.hudEl.classList.contains('on')) S.pause(); } });
+if (P.has('notouch')) ui.setTouch(false); if (P.has('touch')) ui.setTouch(true);
+if (P.has('nodev')) dev.style.display = 'none';
+(S[P.get('s')] || S.menu)();
+if (P.get('s') === 'hud' && P.has('cd')) S.countdown();
+</script>
+</body>
+</html>

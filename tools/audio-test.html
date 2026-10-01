@@ -1,0 +1,41 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Audio test</title>
+<style>body{font:14px sans-serif;background:#111;color:#eee;padding:12px}button{margin:3px;padding:6px 10px}#st{font-family:monospace}</style></head><body>
+<button id="start">START (unlock)</button> <label><input type="checkbox" id="auto" checked> auto rev-sim</label> <label><input type="checkbox" id="inside"> cockpit</label>
+<div id="cars"></div>
+<div>Throttle <input type="range" id="thr" min="0" max="1" step="0.01" value="0.7"> Slip <input type="range" id="slip" min="0" max="1" step="0.01" value="0"></div>
+<div>Surface <select id="surf"></select></div>
+<div id="imp"></div><div id="uis"></div>
+<button id="cd">Co-driver</button> <button id="pop">Antilag pop</button> <button id="jump">Landing</button> <button id="stop">stopAll</button>
+<pre id="st"></pre>
+<script type="module">
+import { RallyAudio } from '../js/audio.js';
+import { CARS } from '../js/cars.js';
+const A = window.audio = new RallyAudio(); const $ = (id) => document.getElementById(id);
+let car = CARS[0], rpm = 1000, gear = 1, speed = 0, boost = 0, pop = false, shift = false, hit = 0, errors = 0;
+window.addEventListener('error', () => errors++);
+for (const c of CARS) { const b = document.createElement('button'); b.textContent = c.short || c.id; b.onclick = () => { car = c; A.setCar(c); rpm = c.engine.idle; }; $('cars').append(b); }
+for (const s of 'tarmac slush ice snow gravel mud dirt rocky grass deepsnow sand pavement'.split(' ')) $('surf').append(new Option(s, s));
+$('surf').value = 'gravel';
+for (const k of ['barrier', 'tree', 'rock', 'car', 'ground']) { const b = document.createElement('button'); b.textContent = 'hit ' + k; b.onclick = () => A.impact(0.8, k); $('imp').append(b); }
+for (const k of ['click', 'select', 'back', 'countdown', 'go', 'split', 'finish', 'penalty']) { const b = document.createElement('button'); b.textContent = k; b.onclick = () => A.ui(k); $('uis').append(b); }
+$('start').onclick = async () => { await A.unlock(); A.setCar(car); };
+$('cd').onclick = () => A.codriver("Left 4 over crest, don't cut, 100, into Right 2 tightens");
+$('pop').onclick = () => pop = true; $('jump').onclick = () => hit = 0.9; $('stop').onclick = () => A.stopAll();
+const ratios = [0, 3.2, 2.2, 1.7, 1.35, 1.1, 0.92];
+let last = performance.now(), prevThr = 0;
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  let thr = +$('thr').value; const e = car.engine;
+  if ($('auto').checked) { thr = (Math.sin(now / 2500) > -0.3) ? 1 : 0; $('thr').value = thr; }
+  speed = Math.max(0, speed + (thr * 9 / ratios[gear] * 1.6 - 0.02 * speed - (thr ? 0 : 3)) * dt);
+  rpm = Math.max(e.idle, Math.min(e.limiter, speed / 0.33 * ratios[gear] * 4.1 * 60 / (2 * Math.PI)));
+  if (rpm >= e.redline && gear < 6) { gear++; shift = true; } else if (rpm < e.idle * 2.2 && gear > 1) { gear--; shift = true; }
+  boost += ((e.turbo ? thr * Math.min(1, rpm / e.redline * 1.4) : 0) - boost) * dt * 3;
+  if (e.antilag && prevThr > 0 && !thr) pop = true; prevThr = thr;
+  A.update(dt, { rpm, throttle: thr, load: thr ? 1 : -0.6, gear, speed, turboBoost: boost, antilagPop: pop, shift, wheelSlip: [+$('slip').value, 0, 0, 0], surface: $('surf').value, onGround: true, suspHit: hit, camInside: $('inside').checked, paused: false });
+  pop = shift = false; hit = 0;
+  $('st').textContent = `ctx=${A.ctx && A.ctx.state} car=${car.id} rpm=${rpm | 0} gear=${gear} speed=${speed.toFixed(1)} boost=${boost.toFixed(2)} errors=${errors}`;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script></body></html>

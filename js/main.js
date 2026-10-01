@@ -1,0 +1,587 @@
+// Rally Legends — game orchestration: menus, stage loading, race loop, camera, timing, championship.
+import * as THREE from './vendor/three.module.js';
+import { loadStage, loadStageIndex, SURFACES } from './stage.js';
+import { Car, TYRE_COMPOUNDS, defaultCompound } from './physics.js';
+import { CARS, carById } from './cars.js';
+import { buildWorld } from './world.js';
+import { buildCarModel } from './carmodel.js';
+import { RallyFX } from './fx.js';
+import { RallyAudio } from './audio.js';
+import { UI } from './ui.js';
+import { Input } from './input.js';
+import { generatePaceNotes, CoDriver, noteShort } from './pacenotes.js';
+import { rivalField, fmtTime } from './rivals.js';
+
+// ---------- persistence ----------
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem('rl_' + k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('rl_' + k, JSON.stringify(v)); } catch {} },
+};
+const isTouch = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+const isMobile = isTouch && Math.min(screen.width, screen.height) < 900;
+const DEFAULT_SETTINGS = {
+  quality: 'auto', camera: 'chase', units: 'kmh', codriver: true, codriverVoice: true,
+  volume: { master: 0.8, engine: 0.8, fx: 0.8, codriver: 0.9 }, touchLayout: 'wheel', invertTilt: false,
+  steerSensitivity: 0.5, showPaceNotes: true, damage: true,
+};
+const settings = Object.assign({}, DEFAULT_SETTINGS, LS.get('settings', {}));
+settings.volume = Object.assign({}, DEFAULT_SETTINGS.volume, settings.volume || {});
+const records = LS.get('records', {}); // stageId -> {time, car, date}
+const profile = LS.get('profile', { selectedCar: 'impreza', selectedStage: 'ouninpohja', difficulty: 'amateur', assists: { autoGear: true, steerAssist: 0.5, tcs: false, abs: false } });
+const saveProfile = () => LS.set('profile', profile);
+const qualityLevel = () => settings.quality === 'auto' ? (isMobile ? 'med' : 'high') : settings.quality;
+
+// ---------- renderer ----------
+const canvas = document.getElementById('game');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: !isMobile, powerPreference: 'high-performance' });
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+function applyQuality() {
+  const q = qualityLevel();
+  renderer.setPixelRatio(Math.min(devicePixelRatio, q === 'high' ? 1.75 : q === 'med' ? 1.35 : 1));
+  renderer.shadowMap.enabled = q === 'high';
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+}
+applyQuality();
+const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 6000);
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.fov = w < h ? 78 : 62; // portrait phones need a wider vertical FOV
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+// ---------- systems ----------
+const input = new Input();
+const audio = new RallyAudio();
+let stageIndex = [];
+const ui = new UI(document.getElementById('ui'), { cars: CARS, stages: [] });
+const unlockAudio = () => { audio.unlock().catch(() => {}); };
+addEventListener('pointerdown', unlockAudio); addEventListener('keydown', unlockAudio);
+
+// game state
+const G = {
+  mode: 'menu',          // menu | loading | countdown | racing | finished | paused
+  scene: null, world: null, stage: null, car: null, model: null, fx: null, notes: null, codriver: null,
+  t: 0, raceTime: 0, penalty: 0, splits: [], splitIdx: 0, progress: 0, countdown: 0,
+  camMode: settings.camera, offTimer: 0, wrongWayT: 0, recovering: 0, championship: null, lastNoteText: '',
+  rivals: [], difficulty: profile.difficulty || 'amateur', ghost: null,
+};
+
+// ---------- menu showroom scene ----------
+let showroom = null;
+function buildShowroom() {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x15171a);
+  scene.fog = new THREE.Fog(0x15171a, 12, 40);
+  const hemi = new THREE.HemisphereLight(0xdfe6ee, 0x2a2622, 0.9); scene.add(hemi);
+  const key = new THREE.DirectionalLight(0xfff2e0, 2.4); key.position.set(5, 8, 4); key.castShadow = true;
+  key.shadow.mapSize.set(1024, 1024); key.shadow.camera.left = -5; key.shadow.camera.right = 5; key.shadow.camera.top = 5; key.shadow.camera.bottom = -5;
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0xffcc66, 1.2); rim.position.set(-6, 3, -5); scene.add(rim);
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(14, 64), new THREE.MeshStandardMaterial({ color: 0x24262a, roughness: 0.85, metalness: 0.0 }));
+  floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; scene.add(floor);
+  const ring = new THREE.Mesh(new THREE.RingGeometry(3.4, 3.48, 96), new THREE.MeshBasicMaterial({ color: 0xffcc00 }));
+  ring.rotation.x = -Math.PI / 2; ring.position.y = 0.005; scene.add(ring);
+  const holder = new THREE.Group(); scene.add(holder);
+  showroom = { scene, holder, model: null, carId: null, angle: 0.6 };
+}
+function showroomCar(id) {
+  if (!showroom) buildShowroom();
+  if (showroom.carId === id) return;
+  if (showroom.model) { showroom.holder.clear(); showroom.model.dispose?.(); }
+  const spec = carById(id);
+  const m = buildCarModel(spec, { quality: qualityLevel() });
+  attachWheels(m, spec, null);
+  m.group.traverse((o) => { if (o.isMesh) { o.castShadow = true; } });
+  showroom.holder.add(m.group);
+  showroom.model = m; showroom.carId = id;
+}
+
+// wheel pivots: model.wheels are placed at static positions inside steering pivots
+function attachWheels(m, spec, physCar) {
+  const d = spec.dims;
+  m.pivots = [];
+  for (let i = 0; i < 4; i++) {
+    const front = i < 2, left = i % 2 === 0;
+    const pv = new THREE.Group();
+    pv.position.set((left ? -1 : 1) * (front ? d.trackF : d.trackR) / 2, d.wheelR, front ? -d.wheelbase / 2 : d.wheelbase / 2);
+    pv.add(m.wheels[i]);
+    m.group.add(pv); m.pivots.push(pv);
+  }
+}
+
+// ---------- menus ----------
+function stagesForUI() { return stageIndex; }
+function goMainMenu() {
+  teardownStage();
+  G.mode = 'menu'; ui.showHUD?.(false); ui.setTouch?.(false);
+  showroomCar(profile.selectedCar);
+  ui.showMainMenu({
+    profile,
+    onQuickRace: () => goStageSelect(false),
+    onChampionship: () => goChampionship(),
+    onFreeRoam: () => goStageSelect(false),
+    onSettings: () => goSettings(goMainMenu),
+    onRecords: () => ui.showRecords({ records, stages: stagesForUI(), cars: CARS, onBack: goMainMenu }),
+  });
+}
+function goStageSelect() {
+  ui.showStageSelect({
+    stages: stagesForUI(), selectedId: profile.selectedStage, records,
+    onPick: (id) => { profile.selectedStage = id; saveProfile(); goCarSelect(() => goSetup(id, false)); },
+    onBack: goMainMenu,
+  });
+}
+function goCarSelect(next, back = goStageSelect) {
+  showroomCar(profile.selectedCar);
+  ui.showCarSelect({
+    cars: CARS, selectedId: profile.selectedCar, previewCanvas: null,
+    onPick: (id) => { profile.selectedCar = id; saveProfile(); next(); },
+    onBack: back,
+    onBrowse: (id) => showroomCar(id),
+  });
+}
+function goSetup(stageId, champ) {
+  const meta = stageIndex.find((s) => s.id === stageId);
+  const car = carById(profile.selectedCar);
+  ui.showSetup({
+    car, stage: meta,
+    compounds: Object.entries(TYRE_COMPOUNDS).map(([id, c]) => ({ id, label: c.label })),
+    compound: defaultCompound(meta.surface), assists: Object.assign({}, profile.assists), difficulty: G.difficulty,
+    onStart: ({ compound, assists, difficulty }) => {
+      profile.assists = assists; if (difficulty) { G.difficulty = difficulty; profile.difficulty = difficulty; }
+      saveProfile();
+      startStage(stageId, { compound, assists, champ });
+    },
+    onBack: champ ? goChampionship : () => goCarSelect(() => goSetup(stageId, false)),
+  });
+}
+function goSettings(back) {
+  ui.showSettings({
+    settings: JSON.parse(JSON.stringify(settings)),
+    onChange: (s) => {
+      const qChanged = s.quality !== settings.quality;
+      Object.assign(settings, s); LS.set('settings', settings);
+      audio.setVolume(settings.volume);
+      G.camMode = settings.camera;
+      if (qChanged) { applyQuality(); G.world?.setQuality?.(qualityLevel()); }
+      if (G.mode !== 'menu') ui.setTouchLayout?.(settings.touchLayout);
+    },
+    onBack: back,
+  });
+}
+
+// ---------- championship ----------
+function goChampionship() {
+  let c = LS.get('champ', null);
+  if (!c || c.finished) {
+    c = { events: stageIndex.map((s) => ({ stageId: s.id, done: false, time: null, pos: null })), totals: {}, car: profile.selectedCar, finished: false };
+  }
+  G.championship = c;
+  const standings = champStandings(c);
+  ui.showChampionship({
+    events: c.events, standings, finished: c.finished,
+    onContinue: () => {
+      const next = c.events.find((e) => !e.done);
+      if (!next) { c.finished = true; LS.set('champ', c); return goMainMenu(); }
+      if (c.events.every((e) => !e.done)) return goCarSelect(() => { c.car = profile.selectedCar; LS.set('champ', c); goSetup(next.stageId, true); }, goChampionship);
+      profile.selectedCar = c.car; goSetup(next.stageId, true);
+    },
+    onBack: () => { G.championship = null; goMainMenu(); },
+  });
+}
+function champStandings(c) {
+  const tot = {};
+  for (const [name, t] of Object.entries(c.totals)) tot[name] = t;
+  return Object.entries(tot).map(([name, total]) => ({ name, total, car: name === 'You' ? c.car : '', isPlayer: name === 'You' })).sort((a, b) => a.total - b.total);
+}
+
+// ---------- stage lifecycle ----------
+function teardownStage() {
+  if (!G.scene) return;
+  G.world?.dispose?.(); G.fx?.dispose?.(); G.model?.dispose?.();
+  G.scene.traverse((o) => { if (o.geometry) o.geometry.dispose?.(); });
+  G.scene = G.world = G.stage = G.car = G.model = G.fx = null;
+}
+
+async function startStage(stageId, { compound, assists, champ }) {
+  teardownStage();
+  G.mode = 'loading';
+  ui.hideAll(); ui.setLoading?.(0.05, 'Loading stage data');
+  try {
+    const stage = await loadStage(stageId);
+    const meta = stageIndex.find((s) => s.id === stageId);
+    stage.meta.refTime = meta?.refTime;
+    ui.setLoading?.(0.25, 'Building ' + stage.meta.name);
+    await new Promise((r) => setTimeout(r, 30));
+    const scene = new THREE.Scene();
+    const world = await buildWorld(scene, stage, { quality: qualityLevel(), renderer });
+    ui.setLoading?.(0.8, 'Preparing car');
+    await new Promise((r) => setTimeout(r, 20));
+    const spec = carById(profile.selectedCar);
+    const car = new Car(spec, stage, { compound, assists, colliders: world.colliders || [] });
+    car.noDamage = !settings.damage;
+    car.placeAtS(stage.startS - 8);
+    for (let i = 0; i < 40; i++) car.update(1 / 60); // settle on suspension
+    car.placeAtS(stage.startS - 8);
+    for (let i = 0; i < 40; i++) car.update(1 / 60);
+    const model = buildCarModel(spec, { quality: qualityLevel() });
+    attachWheels(model, spec, car);
+    model.group.traverse((o) => { if (o.isMesh) { o.castShadow = true; } });
+    scene.add(model.group);
+    const fx = new RallyFX(scene, { quality: qualityLevel() });
+    const notes = generatePaceNotes(stage);
+    Object.assign(G, {
+      scene, world, stage, car, model, fx, notes, codriver: new CoDriver(notes),
+      raceTime: 0, penalty: 0, splits: [], splitIdx: 0, countdown: 3.999, mode: 'countdown', champ: !!champ,
+      offTimer: 0, wrongWayT: 0, recovering: 0, compound, lastNoteText: '', camInit: false, lastCount: 4,
+      rivals: rivalField(meta || stage.meta, G.difficulty, CARS.map((c) => c.id)), best: records[stageId] || null,
+      dirt: 0, finishedAt: 0,
+    });
+    model.setLights?.({ head: world.isNight || stage.meta.env === 'city_dusk' || stage.meta.env === 'wales_overcast', brake: 0, reverse: false });
+    audio.setCar(spec); audio.setVolume(settings.volume);
+    ui.setLoading?.(1, '');
+    ui.hideAll();
+    ui.showHUD(true);
+    if (isTouch) { ui.setTouch?.(true); ui.setTouchLayout?.(settings.touchLayout); wireTouchButtons(); }
+    ui.showMessage?.(`${stage.meta.flag} ${stage.meta.name.toUpperCase()} · ${(stage.length / 1000).toFixed(2)} KM`, 2500);
+    if (settings.codriver) audio.codriver(`${stage.meta.name}. ${notes[0] ? notes[0].text : ''}`);
+    G.codriver.calledUpTo = 0;
+  } catch (e) {
+    console.error(e);
+    ui.toast?.('Failed to load stage: ' + e.message);
+    goMainMenu();
+  }
+}
+let touchWired = false;
+function wireTouchButtons() {
+  if (touchWired || !ui.touch) return; touchWired = true;
+  ui.touch.shiftUp?.(() => G.car?.shiftUp());
+  ui.touch.shiftDown?.(() => G.car?.shiftDown());
+  ui.touch.onPause?.(() => pauseGame());
+  ui.touch.onCamera?.(() => cycleCamera());
+  ui.touch.onRecover?.(() => doRecover());
+}
+const CAMS = ['chase', 'chase_far', 'bumper', 'bonnet', 'cockpit'];
+function cycleCamera() { G.camMode = CAMS[(CAMS.indexOf(G.camMode) + 1) % CAMS.length]; settings.camera = G.camMode; LS.set('settings', settings); ui.toast?.('Camera: ' + G.camMode.replace('_', ' ')); }
+function doRecover() {
+  if (!G.car || G.mode !== 'racing') return;
+  G.penalty += G.car.recover(); G.recovering = 1.2;
+  ui.toast?.('Recovered +5.0s'); audio.ui?.('penalty');
+}
+function pauseGame() {
+  if (G.mode !== 'racing' && G.mode !== 'countdown') return;
+  G.prevMode = G.mode; G.mode = 'paused'; audio.pause?.();
+  ui.showPause({
+    onResume: resumeGame,
+    onRestart: () => { ui.hideAll(); const id = G.stage.meta.id; startStage(id, { compound: G.compound, assists: profile.assists, champ: G.champ }); },
+    onRecover: () => { resumeGame(); doRecover(); },
+    onSettings: () => goSettings(() => { G.mode = 'paused'; pauseGame.call(null); G.mode = 'paused'; showPauseAgain(); }),
+    onQuit: () => { audio.stopAll?.(); goMainMenu(); },
+  });
+}
+function showPauseAgain() { G.mode = G.prevMode; pauseGame(); }
+function resumeGame() { ui.hideAll(); ui.showHUD(true); G.mode = G.prevMode || 'racing'; audio.resume?.(); }
+
+function finishStage() {
+  G.mode = 'finished'; G.finishedAt = performance.now();
+  const total = Math.round(G.raceTime * 1000 + G.penalty * 1000);
+  const id = G.stage.meta.id;
+  const prev = records[id];
+  const isRecord = !prev || total < prev.time;
+  if (isRecord) { records[id] = { time: total, car: profile.selectedCar, date: Date.now() }; LS.set('records', records); }
+  audio.ui?.('finish');
+  const field = G.rivals.map((r) => ({ name: r.name, car: r.car, time: r.time }));
+  field.push({ name: 'You', car: profile.selectedCar, time: total, isPlayer: true });
+  field.sort((a, b) => a.time - b.time);
+  const pos = field.findIndex((r) => r.isPlayer) + 1;
+  let nextLabel = 'Next stage', onNext;
+  if (G.champ && G.championship) {
+    const c = G.championship;
+    const ev = c.events.find((e) => e.stageId === id);
+    if (ev) { ev.done = true; ev.time = total; ev.pos = pos; }
+    for (const r of field) c.totals[r.name] = (c.totals[r.name] || 0) + r.time;
+    if (c.events.every((e) => e.done)) c.finished = true;
+    LS.set('champ', c);
+    nextLabel = c.finished ? 'Final standings' : 'Next event';
+    onNext = () => goChampionship();
+  } else {
+    const i = stageIndex.findIndex((s) => s.id === id);
+    const nx = stageIndex[(i + 1) % stageIndex.length];
+    onNext = () => { profile.selectedStage = nx.id; saveProfile(); goSetup(nx.id, false); };
+  }
+  setTimeout(() => {
+    if (G.mode !== 'finished') return;
+    ui.showHUD(false); ui.setTouch?.(false);
+    ui.showResults({
+      stage: G.stage.meta, car: carById(profile.selectedCar), time: total, penalties: G.penalty, splits: G.splits,
+      rivals: field, isRecord, nextLabel,
+      onRetry: () => startStage(id, { compound: G.compound, assists: profile.assists, champ: G.champ }),
+      onNext, onMenu: goMainMenu,
+    });
+  }, 2200);
+}
+
+// ---------- camera ----------
+const cam = { pos: new THREE.Vector3(), look: new THREE.Vector3(), yaw: 0, pitchLag: 0, shake: 0, fovKick: 0 };
+const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _c = new THREE.Vector3(), _qq = new THREE.Quaternion(), _e = new THREE.Euler();
+const BODY_CAMS = { bumper: [0, 0.55, -1.0], bonnet: [0, 1.12, -0.55], cockpit: [-0.36, 1.08, 0.35] };
+function updateCamera(dt) {
+  const car = G.car, spec = car.spec, st = G.stage;
+  const fwd = _a.set(0, 0, -1).applyQuaternion(car.quat);
+  const heading = Math.atan2(-fwd.x, -fwd.z);
+  // body pose of the model origin
+  const body = G.model.group;
+  if (BODY_CAMS[G.camMode]) {
+    const o = BODY_CAMS[G.camMode];
+    const zoff = G.camMode === 'cockpit' ? o[2] - spec.dims.wheelbase * 0.05 : G.camMode === 'bumper' ? -spec.dims.length / 2 + 0.05 : -spec.dims.wheelbase * 0.25;
+    camera.position.set(o[0], o[1] * (spec.dims.height / 1.38), zoff).applyQuaternion(body.quaternion).add(body.position);
+    _qq.copy(body.quaternion);
+    camera.quaternion.slerp(_qq, G.camInit ? Math.min(1, dt * 30) : 1);
+    G.camInit = true;
+    camera.near = 0.05; camera.updateProjectionMatrix();
+    return;
+  }
+  if (camera.near !== 0.1) { camera.near = 0.1; camera.updateProjectionMatrix(); }
+  const far = G.camMode === 'chase_far';
+  const dist = (far ? 8.2 : 5.6) + spec.dims.length * 0.3, height = far ? 2.9 : 1.95;
+  // follow the velocity direction when sliding a bit (rally cams look where the car is going), else heading
+  const v = car.vel, spd = Math.hypot(v.x, v.z);
+  let target = heading;
+  if (spd > 4) {
+    const vh = Math.atan2(-v.x, -v.z);
+    let d = vh - heading; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI;
+    if (Math.abs(d) < 1.6) target = heading + d * 0.35; // blend toward travel direction
+  }
+  if (!G.camInit) { cam.yaw = target; }
+  let dy = target - cam.yaw; while (dy > Math.PI) dy -= 2 * Math.PI; while (dy < -Math.PI) dy += 2 * Math.PI;
+  cam.yaw += dy * Math.min(1, dt * (far ? 3.5 : 4.5));
+  const cx = car.pos.x + Math.sin(cam.yaw) * dist, cz = car.pos.z + Math.cos(cam.yaw) * dist;
+  let cy = car.pos.y + height;
+  const g = st.heightAt(cx, cz, car.roadHint) + 0.6;
+  if (cy < g) cy = g;
+  const desired = _b.set(cx, cy, cz);
+  if (!G.camInit) cam.pos.copy(desired); else {
+    cam.pos.x += (desired.x - cam.pos.x) * Math.min(1, dt * 12);
+    cam.pos.z += (desired.z - cam.pos.z) * Math.min(1, dt * 12);
+    cam.pos.y += (desired.y - cam.pos.y) * Math.min(1, dt * 6);
+  }
+  if (cam.pos.y < g) cam.pos.y = g;
+  const look = _c.set(car.pos.x - Math.sin(cam.yaw) * 4, car.pos.y + 0.75, car.pos.z - Math.cos(cam.yaw) * 4);
+  if (!G.camInit) cam.look.copy(look); else cam.look.lerp(look, Math.min(1, dt * 14));
+  camera.position.copy(cam.pos);
+  // shake: rough surfaces, landings, impacts
+  const rough = (SURFACES[car.wheels[0].surface]?.bump || 0) * spd * 0.03;
+  cam.shake = Math.max(cam.shake * Math.exp(-dt * 6), car.suspHit * 0.25, rough);
+  if (cam.shake > 0.001) { camera.position.x += (Math.random() - 0.5) * cam.shake * 0.3; camera.position.y += (Math.random() - 0.5) * cam.shake * 0.3; }
+  camera.lookAt(cam.look);
+  const baseFov = innerWidth < innerHeight ? 78 : 62;
+  const fov = baseFov + Math.min(14, Math.max(0, spd - 15) * 0.18);
+  if (Math.abs(camera.fov - fov) > 0.05) { camera.fov += (fov - camera.fov) * Math.min(1, dt * 3); camera.updateProjectionMatrix(); }
+  G.camInit = true;
+}
+
+// ---------- sync visuals from physics ----------
+const _p = new THREE.Vector3(), _n = new THREE.Vector3(), _vel = new THREE.Vector3();
+let lastLights = '';
+function syncCar(dt) {
+  const car = G.car, m = G.model;
+  // model origin = CG + q*(0,-cgY,-cgZ)
+  m.group.quaternion.copy(car.quat);
+  m.group.position.set(0, -car.cgY, -car.cgZ).applyQuaternion(car.quat).add(car.pos);
+  for (let i = 0; i < 4; i++) {
+    const w = car.wheels[i], pv = m.pivots[i];
+    const len = Math.min(w.rest, Math.max(w.rest - w.travel, w.len));
+    pv.position.y = w.mount.y + car.cgY - len;
+    pv.rotation.y = -w.steer;
+    m.wheels[i].rotation.x = -w.spin;
+  }
+  const head = G.world.isNight || G.stage.meta.env === 'city_dusk' || G.stage.meta.env === 'wales_overcast';
+  const key = `${head}|${car.input.brake > 0.1 ? 1 : 0}|${car.gear === -1}`;
+  if (key !== lastLights) { lastLights = key; m.setLights?.({ head, brake: car.input.brake > 0.1 ? 1 : 0, reverse: car.gear === -1 }); }
+  // dirt
+  const surf = car.wheels[2].surface, sp = car.speed;
+  if (surf !== 'tarmac' && surf !== 'pavement') G.dirt = Math.min(1, G.dirt + dt * sp * 0.0009);
+  if ((G._dirtT = (G._dirtT || 0) + dt) > 0.5) { G._dirtT = 0; m.setDirt?.(G.dirt, SURFACES[surf]?.color || 0x6b5a45); m.setDamage?.(car.damage.body); }
+  // fx + audio events
+  const fx = G.fx;
+  for (let i = 0; i < 4; i++) {
+    const w = car.wheels[i];
+    if (!w.contact) { fx.skidBreak(i); continue; }
+    const slip = car.telemetry ? null : null;
+    const ls = Math.max(Math.abs(w.slipRatio) / 0.25, Math.abs(w.slipAngle) / 0.3) - 0.35;
+    _vel.copy(car.vel);
+    fx.emitWheel(i, w.contactPos, _vel, Math.max(0, ls), w.surface, sp, dt);
+    fx.skid(i, w.contactPos, w.normal, Math.max(0, ls), w.surface, dt);
+  }
+  for (const im of car.impacts) {
+    fx.impact(im.pos, im.strength, car.wheels[0].surface);
+    audio.impact(im.strength, im.kind === 'ground' ? 'ground' : im.kind === 'wall' || im.kind === 'barrier' || im.kind === 'building' ? 'barrier' : im.kind === 'rock' ? 'rock' : 'tree');
+    cam.shake = Math.max(cam.shake, im.strength * 0.6);
+    if (im.strength > 0.3 && navigator.vibrate) navigator.vibrate(Math.round(30 + im.strength * 60));
+  }
+  if (car.engine.antilagPop && m.exhaust) {
+    m.flame?.();
+    m.exhaust.getWorldPosition(_p); _n.set(0, 0, 1).applyQuaternion(car.quat);
+    fx.backfire(_p, _n);
+  }
+}
+
+// ---------- race loop ----------
+const tel = {};
+const hud = { nextNotes: [], damageParts: {} };
+function noteIcon(n) { return { dir: n.dir, sev: n.sev }; }
+function raceUpdate(dt) {
+  const car = G.car, st = G.stage, inp = input.poll(dt, settings.steerSensitivity);
+  if (input.was('Escape') || input.was('KeyP') || input.was('Pause')) { pauseGame(); return; }
+  if (input.was('KeyC')) cycleCamera();
+  if (input.was('KeyR')) doRecover();
+  if (input.was('KeyE')) car.shiftUp();
+  if (input.was('KeyQ')) car.shiftDown();
+  if (input.was('KeyG')) { car.assists.autoGear = !car.assists.autoGear; ui.toast?.(car.assists.autoGear ? 'Automatic gearbox' : 'Manual gearbox (Q / E)'); }
+  if (G.mode === 'countdown') {
+    G.countdown -= dt;
+    const n = Math.ceil(G.countdown);
+    if (n !== G.lastCount && n >= 0) { G.lastCount = n; ui.showCountdown?.(n); audio.ui?.(n > 0 ? 'countdown' : 'go'); }
+    // hold the car on the line (handbrake + brake), allow revving
+    car.input.steer = 0; car.input.throttle = inp.throttle; car.input.brake = 1; car.input.handbrake = 1;
+    if (G.countdown <= 0) { G.mode = 'racing'; G.raceTime = 0; }
+  } else {
+    car.input.steer = inp.steer; car.input.throttle = inp.throttle; car.input.brake = inp.brake; car.input.handbrake = inp.handbrake;
+    if (G.recovering > 0) { G.recovering -= dt; car.input.throttle *= 0.3; }
+  }
+  car.update(Math.min(dt, 1 / 30));
+  if (car.needsRecover && G.mode === 'racing') { car.needsRecover = false; doRecover(); }
+  else car.needsRecover = false;
+  const q = car.roadQ;
+  if (G.mode === 'racing') {
+    G.raceTime += dt;
+    // splits
+    if (G.splitIdx < st.splitS.length && q.s >= st.splitS[G.splitIdx] && q.dist < 30) {
+      const t = Math.round(G.raceTime * 1000 + G.penalty * 1000);
+      G.splits.push(t);
+      const best = G.best && G.best.splits ? G.best.splits[G.splitIdx] : null;
+      ui.showSplit?.({ index: G.splitIdx + 1, time: t, delta: best != null ? t - best : null });
+      audio.ui?.('split');
+      G.splitIdx++;
+    }
+    if (q.s >= st.finishS && q.dist < 30 && G.splitIdx >= st.splitS.length) { finishStage(); }
+    // off-stage: too far from road for too long -> auto recover with penalty
+    if (q.dist > st.halfW + 45) { G.offTimer += dt; if (G.offTimer > 4) { G.offTimer = 0; doRecover(); } } else G.offTimer = 0;
+    // wrong way
+    const fwd = _a.set(0, 0, -1).applyQuaternion(car.quat), p = st.pointAtS(q.s);
+    const along = fwd.x * p.tx + fwd.z * p.tz;
+    G.wrongWayT = along < -0.5 && car.speed > 5 ? G.wrongWayT + dt : 0;
+    // co-driver
+    if (settings.codriver) {
+      const calls = G.codriver.update(q.s, car.speed);
+      if (calls.length) {
+        const text = calls.map((n) => n.text).join(', ');
+        if (settings.codriverVoice) audio.codriver(text, calls.some((n) => n.sev === 'hairpin' || n.sev === 'jump' || n.mods.includes('tightens')));
+        G.lastNoteText = calls.map((n) => noteShort(n)).join(' › ');
+      }
+    }
+  }
+  // brake lights / audio
+  car.telemetry(tel);
+  audio.update(dt, {
+    rpm: tel.rpm, throttle: car.input.throttle, load: tel.load, gear: tel.gear, speed: tel.speed, turboBoost: tel.boost,
+    antilagPop: tel.antilagPop, shift: tel.shift, wheelSlip: tel.wheelSlip, surface: tel.surface, onGround: tel.onGround,
+    suspHit: tel.suspHit, camInside: G.camMode === 'cockpit' || G.camMode === 'bonnet', paused: false,
+  });
+  if (navigator.vibrate && tel.suspHit > 0.5) navigator.vibrate(40);
+  // HUD
+  const upcoming = G.codriver.upcoming(q.s, 3);
+  hud.nextNotes.length = 0;
+  for (const n of upcoming) hud.nextNotes.push({ text: noteShort(n), icon: noteIcon(n), dist: Math.max(0, n.s - q.s) });
+  const total = G.raceTime * 1000 + G.penalty * 1000;
+  let delta = null;
+  if (G.rivals.length && G.mode === 'racing') {
+    const lead = G.rivals[0].time; // compare to leader pace at this distance
+    const frac = Math.max(0.0001, (q.s - st.startS) / (st.finishS - st.startS));
+    if (frac > 0.03) delta = total - lead * frac;
+  }
+  const kmh = car.speedKmh;
+  Object.assign(hud, {
+    kmh: settings.units === 'mph' ? kmh * 0.6214 : kmh, units: settings.units, gear: car.gear === 0 && car.shiftTimer > 0 ? car._pendingGear : car.gear,
+    rpm: car.engine.rpm, redline: car.spec.engine.redline, limiter: car.spec.engine.limiter, maxRpm: car.spec.engine.limiter + 500,
+    time: G.mode === 'countdown' ? 0 : total, distance: Math.max(0, q.s - st.startS), length: st.finishS - st.startS,
+    splitIndex: G.splitIdx, splitFractions: st.splitS.map((s) => (s - st.startS) / (st.finishS - st.startS)),
+    damage: car.damage.total, damageParts: car.damage, surface: tel.surface,
+    paceNote: settings.showPaceNotes ? G.lastNoteText : '', nextNotes: settings.showPaceNotes ? hud.nextNotes : [],
+    penalty: G.penalty, stageName: st.meta.name, delta, wrongWay: G.wrongWayT > 1.2, recovering: G.recovering > 0,
+    boost: car.engine.boost, handbrake: car.input.handbrake > 0.1, manual: !car.assists.autoGear,
+  });
+  ui.updateHUD(hud);
+}
+
+// ---------- main loop ----------
+let last = performance.now(), fpsAcc = 0, fpsN = 0, autoQ = { t: 0, frames: 0, slow: 0 };
+function frame(now) {
+  requestAnimationFrame(frame);
+  let dt = (now - last) / 1000; last = now;
+  if (dt > 0.1) dt = 0.1;
+  if (G.mode === 'countdown' || G.mode === 'racing' || G.mode === 'finished') {
+    if (G.mode === 'finished') {
+      // coast to a stop after the flying finish
+      G.car.input.throttle = 0; G.car.input.brake = 0.6; G.car.input.handbrake = 0; G.car.input.steer *= 0.9;
+      G.car.update(dt); G.car.telemetry(tel);
+      audio.update(dt, { rpm: tel.rpm, throttle: 0, load: -0.5, gear: tel.gear, speed: tel.speed, turboBoost: 0, antilagPop: tel.antilagPop, shift: false, wheelSlip: tel.wheelSlip, surface: tel.surface, onGround: tel.onGround, suspHit: 0, camInside: false, paused: false });
+    } else raceUpdate(dt);
+    if (!G.scene) { input.endFrame(); return; }
+    syncCar(dt);
+    G.fx.update(dt, camera);
+    updateCamera(dt);
+    G.world.update(dt, camera, G.car.pos);
+    renderer.render(G.scene, camera);
+    // auto quality: drop a tier if we're consistently slow
+    if (settings.quality === 'auto') {
+      autoQ.t += dt; autoQ.frames++; if (dt > 1 / 40) autoQ.slow++;
+      if (autoQ.t > 4) {
+        if (autoQ.slow / autoQ.frames > 0.4) {
+          const cur = qualityLevel(); const nq = cur === 'high' ? 'med' : 'low';
+          if (nq !== cur) { settings.quality = nq; applyQuality(); G.world.setQuality?.(nq); settings.quality = 'auto'; G.autoQuality = nq; }
+        }
+        autoQ.t = 0; autoQ.frames = 0; autoQ.slow = 0;
+      }
+    }
+  } else if (G.mode === 'paused') {
+    if (G.scene) renderer.render(G.scene, camera);
+    input.poll(dt);
+    if (input.was('Escape') || input.was('Pause')) resumeGame();
+  } else if (G.mode === 'menu') {
+    input.poll(dt);
+    if (input.was('Escape') || input.was('Back')) ui.back?.();
+    if (showroom) {
+      showroom.angle += dt * 0.35;
+      const r = 6.4;
+      camera.position.set(Math.sin(showroom.angle) * r, 1.9, Math.cos(showroom.angle) * r);
+      camera.lookAt(0, 0.55, 0);
+      if (showroom.model) for (const w of showroom.model.wheels) w.rotation.x -= dt * 2;
+      renderer.render(showroom.scene, camera);
+    }
+  }
+  input.endFrame();
+}
+qualityLevel; // keep
+// ---------- boot ----------
+(async () => {
+  try {
+    ui.setLoading?.(0.2, 'Loading stages');
+    stageIndex = await loadStageIndex();
+    ui.stages = stageIndex;
+    audio.setVolume(settings.volume);
+    buildShowroom();
+    ui.bootDone?.();
+    goMainMenu();
+    requestAnimationFrame(frame);
+    // debug hooks
+    window.RL = { G, settings, startStage, goMainMenu, input, audio };
+    const qs = new URLSearchParams(location.search);
+    if (qs.get('stage')) { profile.selectedCar = qs.get('car') || profile.selectedCar; startStage(qs.get('stage'), { compound: defaultCompound(stageIndex.find((s) => s.id === qs.get('stage'))?.surface || 'gravel'), assists: profile.assists }); }
+  } catch (e) { console.error(e); document.body.insertAdjacentHTML('beforeend', `<pre style="color:#fff;position:fixed;top:0;left:0;z-index:99">${e.stack}</pre>`); }
+})();
