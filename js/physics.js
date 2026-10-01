@@ -3,12 +3,14 @@
 // Fixed substeps (default 240 Hz). Ground = stage.heightAt (same function the renderer uses).
 import * as THREE from './vendor/three.module.js';
 import { SURFACES } from './stage.js';
+import { applySetup } from './tuning.js';
 
 const G = 9.81, RHO = 1.2;
 const _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3(), _v3 = new THREE.Vector3(), _v4 = new THREE.Vector3();
 const _q = new THREE.Quaternion(), _m = new THREE.Matrix3(), _m4 = new THREE.Matrix4();
 const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
 const lerp = (a, b, t) => a + (b - a) * t;
+const TUNE = globalThis.RLTUNE || {};
 
 function torqueCurve(curve, rpm) {
   if (rpm <= curve[0][0]) return curve[0][1] * Math.max(0, rpm / curve[0][0]);
@@ -48,6 +50,8 @@ export function defaultCompound(stageSurface) {
 
 export class Car {
   constructor(spec, stage, opts = {}) {
+    this.baseSpec = spec;
+    if (opts.setup) spec = applySetup(spec, opts.setup);
     this.spec = spec; this.stage = stage;
     this.compound = opts.compound || defaultCompound(stage.meta.surface);
     this.assists = Object.assign({ autoGear: true, steerAssist: 0.5, tcs: false, abs: false }, opts.assists || {});
@@ -100,6 +104,9 @@ export class Car {
     this.colliders = opts.colliders || [];
     this._colGrid = null; this._buildColliderGrid();
   }
+
+  // live setup change (pause menu): swaps the tuned spec without rebuilding the car
+  setSetup(setup) { this.spec = setup ? applySetup(this.baseSpec, setup) : this.baseSpec; }
 
   _buildColliderGrid() {
     const g = new Map(), C = 20;
@@ -230,12 +237,20 @@ export class Car {
     const assist = this.assists.steerAssist;
     const slide = spd > 3 ? Math.atan2(this._localVel.x, Math.max(0.5, fwdSpeed)) : 0;
     this.slideAngle = slide;
-    const speedLock = 1 / (1 + Math.max(0, fwdSpeed - 8) / (assist > 0 ? 38 : 70));
+    const speedLock0 = 1 / (1 + Math.max(0, fwdSpeed - 8) / (assist > 0 ? 38 : 70));
+    // countersteering (steer input on the same side as the slide) gets the full lock regardless of speed:
+    // the speed-sensitive reduction is for straight-line stability, never for catching a slide
+    const cs = spd > 4 && inp.steer * slide > 0 ? clamp(Math.abs(slide) / 0.2, 0, 1) : 0;
+    const speedLock = lerp(speedLock0, 1, cs);
     let target = inp.steer * s.steerLock * speedLock + this.damage.steering * 0.06;
-    // countersteer assist only helps when the player isn't steering; it must never fight a deliberate drift
-    if (assist > 0 && spd > 5) target += clamp(slide * 0.8 * assist, -0.3, 0.3) * (1 - Math.abs(inp.steer) * 0.6);
+    if (assist > 0 && spd > 5) {
+      // hands-off: wheels self-align toward the direction of travel (caster)
+      target += clamp(slide * 0.8 * assist, -0.3, 0.3) * (1 - Math.abs(inp.steer) * 0.6);
+      // countersteering: never point the wheels less than the slide angle needs (catch assist)
+      if (cs > 0) { const need = clamp(Math.abs(slide) * (0.6 + 0.5 * assist), 0, s.steerLock); if (Math.abs(target) < need) target = Math.sign(slide) * lerp(Math.abs(target), need, assist); }
+    }
     target = clamp(target, -s.steerLock, s.steerLock);
-    const rate = 2.8 + 2.5 * (1 - speedLock); // rad/s at the wheels
+    const rate = (TUNE.rate ?? 5.0) * (s.steerRate || 1) * (1 + 0.6 * cs) + 2.0 * (1 - speedLock); // rad/s at the wheels
     this.steerSmooth += clamp(target - this.steerSmooth, -rate * h, rate * h);
     const st0 = this.steerSmooth;
     // Ackermann: inner wheel steers more
@@ -253,7 +268,7 @@ export class Car {
     let cf = s.drivetrain === 'AWD' ? s.diff.centerFront : s.drivetrain === 'FWD' ? 1 : 0;
     if (s.drivetrain === 'AWD') {
       const sl = clamp(Math.abs(this.slideAngle || 0) / 0.35, 0, 1) * clamp(inp.throttle, 0, 1);
-      cf = cf * (0.9 - 0.8 * sl); // e.g. 47% front -> 42% normally, ~5% fully sideways at full throttle
+      cf = cf * (0.9 - (TUNE.cfSide ?? 0.8) * sl); // shifts rearward when sideways on throttle
     }
     const wf = (this.wheels[0].omega + this.wheels[1].omega) / 2, wr = (this.wheels[2].omega + this.wheels[3].omega) / 2;
     this._drivenOmega = s.drivetrain === 'AWD' ? wf * cf + wr * (1 - cf) : s.drivetrain === 'FWD' ? wf : wr;
@@ -425,18 +440,21 @@ export class Car {
       const T = TYRE[w.surface] || TYRE.gravel;
       const loadRef = this.mass * G / 4;
       const loadSens = clamp(1 - 0.1 * (Fz / loadRef - 1), 0.7, 1.15);
-      const mu = w.surf.mu * (compound[w.surface] ?? 1) * s.tyre.grip * loadSens;
+      const mu = w.surf.mu * (compound[w.surface] ?? 1) * s.tyre.grip * (w.front ? (s.tyre.gripF ?? 1) * (TUNE.gF ?? 1.05) : (s.tyre.gripR ?? 1) * (TUNE.gR ?? 1.1)) * loadSens;
       const den = Math.max(Math.abs(vx), 2.0);
       const sr = (w.omega * w.R - vx) / den;
       const alpha = Math.atan2(vy, Math.max(Math.abs(vx), 1.5));
-      const sx = sr / T.kPeak, sy = Math.tan(clamp(alpha, -1.4, 1.4)) / Math.tan(T.aPeak);
+      // lateral priority: a spinning tyre keeps more of its side grip than a pure friction circle predicts
+      // (equivalent to a longer longitudinal peak slip); this is what lets the rear bite again under power
+      const kP = T.kPeak / (TUNE.lw ?? 0.5);
+      const sx = sr / kP, sy = Math.tan(clamp(alpha, -1.4, 1.4)) / Math.tan(T.aPeak);
       const sc = Math.hypot(sx, sy);
       const Fmax = mu * Fz;
       const F = Fmax * tyreShape(sc, T.fall);
       // longitudinal: implicit wheel solve with secant stiffness
-      const Kx = sc > 1e-4 ? (F / sc) / T.kPeak : Fmax * 1.5708 / T.kPeak * s.tyre.stiff;
+      const Kx = sc > 1e-4 ? (F / sc) / kP : Fmax * 1.5708 / kP * s.tyre.stiff;
       let Td = w.driveT;
-      if (this.assists.tcs && Td > 0 && sr > T.kPeak * 1.1) Td *= clamp(1 - (sr - T.kPeak * 1.1) / (T.kPeak * 2.5), 0.25, 1);
+      if (this.assists.tcs && Td > 0 && sr > kP * 1.1) Td *= clamp(1 - (sr - kP * 1.1) / (kP * 2.5), 0.25, 1);
       let om = (Iw * w.omega + h * Td + h * Kx * w.R * vx / den) / (Iw + h * Kx * w.R * w.R / den);
       let bT = w.brakeT;
       if (this.assists.abs && brakeIn > 0 && w.front !== undefined && sr < -T.kPeak * 1.2 && Math.abs(vx) > 3) bT *= 0.4;
@@ -461,6 +479,12 @@ export class Car {
     const v2 = spd * spd;
     acc.f.addScaledVector(this.vel, -0.5 * RHO * s.aero.cd * s.aero.area * spd);
     acc.f.addScaledVector(up, -0.5 * RHO * s.aero.down * s.aero.area * v2);
+    // ---- slide catch: while the player countersteers, damp the yaw rate that is still growing the slide
+    // (stands in for the self-aligning torque + driver feel a pad/keyboard can't give). Scales with steer assist.
+    if (cs > 0 && assist > 0 && this.wheelsOnGround >= 2) {
+      const yr = this.angVel.dot(up);
+      if (yr * slide > 0) acc.t.addScaledVector(up, -yr * this.I.y * (TUNE.catchK ?? 3.0) * assist * cs);
+    }
     // ---- body vs ground + obstacles ----
     this._bodyGround(acc, h);
     // ---- integrate ----

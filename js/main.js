@@ -11,6 +11,7 @@ import { UI } from './ui.js';
 import { Input } from './input.js';
 import { generatePaceNotes, CoDriver, noteShort } from './pacenotes.js';
 import { rivalField, fmtTime } from './rivals.js';
+import { paramsFor, PRESETS, baseSetup, presetSetup, clampSetup, isDefault } from './tuning.js';
 
 // ---------- persistence ----------
 const LS = {
@@ -166,10 +167,33 @@ function goCarSelect(next, back = goStageSelect) {
     onBrowse: (id) => showroomCar(id),
   });
 }
+// ---------- car setups (per car, persisted) ----------
+const setups = LS.get('setups', {});
+function setupFor(id) { const spec = carById(id); return setups[id] ? clampSetup(spec, setups[id]) : null; }
+function setupLabel(id) {
+  const spec = carById(id), s = setupFor(id); if (!s || isDefault(spec, s)) return 'Default setup';
+  for (const p of Object.keys(PRESETS)) if (p !== 'default' && JSON.stringify(presetSetup(spec, p)) === JSON.stringify(s)) return PRESETS[p].label + ' setup';
+  return 'Custom setup';
+}
+function goGarage(carId, back, overlay = false) {
+  const spec = carById(carId);
+  const save = (v) => { if (isDefault(spec, v)) delete setups[carId]; else setups[carId] = v; LS.set('setups', setups); if (G.car && G.car.baseSpec?.id === carId) G.car.setSetup(setupFor(carId)); };
+  ui.showGarage({
+    car: spec, overlay,
+    tuning: {
+      params: paramsFor(spec), presets: PRESETS, base: baseSetup(spec), value: setupFor(carId) || baseSetup(spec),
+      onChange: save,
+      onPreset: (id) => { const v = presetSetup(spec, id); save(v); return v; },
+      onReset: () => { const v = baseSetup(spec); save(v); return v; },
+    },
+    onBack: back,
+  });
+}
 function goSetup(stageId, champ) {
   const meta = stageIndex.find((s) => s.id === stageId);
   const car = carById(profile.selectedCar);
   ui.showSetup({
+    onGarage: () => goGarage(car.id, () => goSetup(stageId, champ)), setupLabel: setupLabel(car.id),
     car, stage: meta,
     compounds: Object.entries(TYRE_COMPOUNDS).map(([id, c]) => ({ id, label: c.label })),
     compound: defaultCompound(meta.surface), assists: Object.assign({}, profile.assists), difficulty: G.difficulty,
@@ -244,7 +268,7 @@ async function startStage(stageId, { compound, assists, champ }) {
     ui.setLoading?.(0.8, 'Preparing car');
     await new Promise((r) => setTimeout(r, 20));
     const spec = carById(profile.selectedCar);
-    const car = new Car(spec, stage, { compound, assists, colliders: world.colliders || [], substeps: 2 });
+    const car = new Car(spec, stage, { compound, assists, colliders: world.colliders || [], substeps: 2, setup: setupFor(spec.id) });
     car.noDamage = !settings.damage;
     car.placeAtS(stage.startS - 8);
     for (let i = 0; i < 40; i++) car.update(1 / 60); // settle on suspension
@@ -307,6 +331,7 @@ function pauseGame() {
     onRestart: () => { ui.hideAll(); const id = G.stage.meta.id; startStage(id, { compound: G.compound, assists: profile.assists, champ: G.champ }); },
     onRecover: () => { resumeGame(); doRecover(); },
     onSettings: () => goSettings(() => { G.mode = 'paused'; pauseGame.call(null); G.mode = 'paused'; showPauseAgain(); }),
+    onGarage: () => goGarage(G.car.baseSpec.id, () => showPauseAgain(), true),
     onQuit: () => { audio.stopAll?.(); goMainMenu(); },
   });
 }
@@ -362,19 +387,38 @@ function updateCamera(dt) {
   const heading = Math.atan2(-fwd.x, -fwd.z);
   // body pose of the model origin
   const body = G.model.group;
+  const inCockpit = G.camMode === 'cockpit';
+  if (G.model.setInterior && G.model._interior !== inCockpit) { G.model.setInterior(inCockpit); G.model._interior = inCockpit; }
   if (BODY_CAMS[G.camMode]) {
-    const o = BODY_CAMS[G.camMode];
-    const zoff = G.camMode === 'cockpit' ? o[2] - spec.dims.wheelbase * 0.05 : G.camMode === 'bumper' ? -spec.dims.length / 2 + 0.05 : -spec.dims.wheelbase * 0.25;
-    camera.position.set(o[0], o[1] * (spec.dims.height / 1.38), zoff).applyQuaternion(body.quaternion).add(body.position);
+    const o = BODY_CAMS[G.camMode], eye = G.model.eyes?.[G.camMode];
+    if (eye) camera.position.copy(eye);
+    else camera.position.set(o[0], o[1] * (spec.dims.height / 1.38), -spec.dims.wheelbase * 0.25);
+    // head/bumper vibration: small, smooth, scaled by surface roughness
+    const spdB = car.speed, roughB = (SURFACES[car.wheels[0].surface]?.bump || 0) * Math.min(1, spdB / 25);
+    const tt = performance.now() / 1000;
+    if (inCockpit || G.camMode === 'bumper') camera.position.y += (Math.sin(tt * 31) * 0.6 + Math.sin(tt * 19.3 + 1)) * roughB * (inCockpit ? 0.012 : 0.02);
+    camera.position.applyQuaternion(body.quaternion).add(body.position);
+    // orientation: the bumper/bonnet are bolted to the body; the driver's head keeps the horizon steadier
+    // (half the body roll and pitch) and glances into the direction of travel when sideways
     _qq.copy(body.quaternion);
-    camera.quaternion.slerp(_qq, G.camInit ? Math.min(1, dt * 30) : 1);
+    if (inCockpit) {
+      _e.setFromQuaternion(body.quaternion, 'YXZ');
+      const vx = car.vel.x, vz = car.vel.z, spdH = Math.hypot(vx, vz);
+      let look = 0;
+      if (spdH > 5) { let d = Math.atan2(-vx, -vz) - _e.y; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; look = Math.max(-0.5, Math.min(0.5, d * 0.35)); }
+      cam.headYaw = (cam.headYaw || 0) + (look - (cam.headYaw || 0)) * (1 - Math.exp(-dt * 5));
+      _e.x *= 0.55; _e.z *= 0.45; _e.y += cam.headYaw;
+      _qq.setFromEuler(_e);
+    }
+    if (!G.camInit) camera.quaternion.copy(_qq); else camera.quaternion.slerp(_qq, 1 - Math.exp(-dt * (inCockpit ? 18 : 40)));
     G.camInit = true;
-    camera.near = 0.05; camera.updateProjectionMatrix();
+    const fovB = (innerWidth < innerHeight ? 80 : 66) + (inCockpit ? 4 : 0) + Math.min(10, Math.max(0, car.speed - 15) * 0.14);
+    if (camera.near !== 0.04 || Math.abs(camera.fov - fovB) > 0.05) { camera.near = 0.04; camera.fov += (fovB - camera.fov) * (G.camInit ? 1 - Math.exp(-dt * 3) : 1); camera.updateProjectionMatrix(); }
     return;
   }
   if (camera.near !== 0.1) { camera.near = 0.1; camera.updateProjectionMatrix(); }
   const far = G.camMode === 'chase_far';
-  const dist = (far ? 8.2 : 5.6) + spec.dims.length * 0.3, height = far ? 2.9 : 1.95;
+  const dist = (far ? 9.6 : 5.6) + spec.dims.length * 0.3, height = far ? 3.6 : 1.95;
   // follow the velocity direction when sliding a bit (rally cams look where the car is going), else heading
   const v = car.vel, spd = Math.hypot(v.x, v.z);
   let target = heading;
@@ -385,7 +429,7 @@ function updateCamera(dt) {
   }
   if (!G.camInit) { cam.yaw = target; }
   let dy = target - cam.yaw; while (dy > Math.PI) dy -= 2 * Math.PI; while (dy < -Math.PI) dy += 2 * Math.PI;
-  cam.yaw += dy * (1 - Math.exp(-dt * (far ? 3.5 : 4.5)));
+  cam.yaw += dy * (1 - Math.exp(-dt * (far ? 2.6 : 4.5)));
   const cx = car.pos.x + Math.sin(cam.yaw) * dist, cz = car.pos.z + Math.cos(cam.yaw) * dist;
   let cy = car.pos.y + height;
   const g = st.heightAt(cx, cz, car.roadHint) + 0.6;
@@ -401,7 +445,9 @@ function updateCamera(dt) {
   // soft ground clamp: g already sits 0.6 m above the (noisy) verge terrain, so allow a small dip instead of
   // snapping the camera up every time it passes over a bump in the ditch
   if (cam.pos.y < g - 0.35) cam.pos.y = g - 0.35;
-  const look = _c.set(car.pos.x - Math.sin(cam.yaw) * 4, car.pos.y + 0.75, car.pos.z - Math.cos(cam.yaw) * 4);
+  // far cam looks further down the road and a bit lower so more of the stage ahead is in frame
+  const la = far ? 7 : 4;
+  const look = _c.set(car.pos.x - Math.sin(cam.yaw) * la, car.pos.y + (far ? 0.4 : 0.75), car.pos.z - Math.cos(cam.yaw) * la);
   if (!G.camInit) cam.look.copy(look); else cam.look.lerp(look, 1 - Math.exp(-dt * 14));
   camera.position.copy(cam.pos);
   // shake: rough surfaces, landings, impacts
@@ -413,7 +459,7 @@ function updateCamera(dt) {
     camera.position.y += (Math.sin(tt * 23.7 + 0.4) + Math.sin(tt * 13.9 + 2.1)) * 0.5 * cam.shake * 0.16;
   }
   camera.lookAt(cam.look);
-  const baseFov = innerWidth < innerHeight ? 78 : 62;
+  const baseFov = (innerWidth < innerHeight ? 78 : 62) - (far ? 4 : 0);
   const fov = baseFov + Math.min(14, Math.max(0, spd - 15) * 0.18);
   if (Math.abs(camera.fov - fov) > 0.05) { camera.fov += (fov - camera.fov) * (1 - Math.exp(-dt * 3)); camera.updateProjectionMatrix(); }
   G.camInit = true;
@@ -438,6 +484,7 @@ function syncCar(dt) {
     pv.rotation.y = -w.steer;
     m.wheels[i].rotation.x = -w.spin;
   }
+  if (m.steerWheel && m._interior) m.steerWheel.rotation.z = (car.steerSmooth / (car.spec.steerLock || 0.6)) * 2.4; // ~270 deg to full lock
   const head = G.world.isNight || G.stage.meta.env === 'city_dusk' || G.stage.meta.env === 'wales_overcast';
   const key = `${head}|${car.input.brake > 0.1 ? 1 : 0}|${car.gear === -1}`;
   if (key !== lastLights) { lastLights = key; m.setLights?.({ head, brake: car.input.brake > 0.1 ? 1 : 0, reverse: car.gear === -1 }); }
@@ -668,7 +715,7 @@ qualityLevel; // keep
     goMainMenu();
     requestAnimationFrame(frame);
     // debug hooks
-    window.RL = { G, settings, startStage, goMainMenu, input, audio, camera, renderer };
+    window.RL = { G, settings, startStage, goMainMenu, goGarage, goSetup, pauseGame, input, audio, camera, renderer };
     // ?bot=1 : simple autopilot for automated testing
     if (new URLSearchParams(location.search).get('bot')) {
       const botTick = () => {

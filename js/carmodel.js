@@ -343,8 +343,9 @@ export function buildCarModel(spec, { quality = 'high' } = {}) {
     const t0 = 0.08, t1 = 0.93;
     return add(quadGeo(pt(t0, -1), pt(t0, 1), pt(t1, 1), pt(t1, -1)), mat);
   };
-  const windscreen = slopeQuad(uA0, uA1, M.screen, 0.07, true);
-  slopeQuad(uC0, uC1, M.glass, 0.09, false);
+  const glassMeshes = [];
+  const windscreen = slopeQuad(uA0, uA1, M.screen, 0.07, true); glassMeshes.push(windscreen);
+  glassMeshes.push(slopeQuad(uC0, uC1, M.glass, 0.09, false));
   // side windows, split by B-pillar
   const wy0 = yBelt + 0.05, wy1 = H - gBev - 0.05;
   const edgeU = (ua, ub, y) => lerp(ua, ub, (y - (yBelt - 0.02)) / (H - gBev - (yBelt - 0.02)));
@@ -354,9 +355,71 @@ export function buildCarModel(spec, { quality = 'high' } = {}) {
     const fl = edgeU(uA0, uA1, wy0) - 0.06, fh = edgeU(uA0, uA1, wy1) - 0.06;
     const rl = edgeU(uC0, uC1, wy0) + 0.06, rh = edgeU(uC0, uC1, wy1) + 0.06;
     const P3 = (u, y) => [X(y), y, -u];
-    add(quadGeo(P3(uB + 0.04, wy0), P3(fl, wy0), P3(fh, wy1), P3(Math.min(uB + 0.04, fh), wy1)), M.glass);
-    if (rl < uB - 0.12) add(quadGeo(P3(rl, wy0), P3(uB - 0.04, wy0), P3(Math.max(uB - 0.04, rh), wy1), P3(rh, wy1)), M.glass);
+    glassMeshes.push(add(quadGeo(P3(uB + 0.04, wy0), P3(fl, wy0), P3(fh, wy1), P3(Math.min(uB + 0.04, fh), wy1)), M.glass));
+    if (rl < uB - 0.12) glassMeshes.push(add(quadGeo(P3(rl, wy0), P3(uB - 0.04, wy0), P3(Math.max(uB - 0.04, rh), wy1), P3(rh, wy1)), M.glass));
   });
+
+  // ---------- cockpit interior (only shown in the cockpit camera) ----------
+  // The exterior shell is single-sided and the glass is opaque, so from inside you'd see nothing useful.
+  // In cockpit view the glass is hidden and this interior (dash, wheel, pillars, cage, roof liner) is shown.
+  const inside = new THREE.Group(); inside.name = 'interior'; inside.visible = false; group.add(inside);
+  const Mi = { dash: Std({ color: 0x1c1c1e, roughness: 0.85 }), trim: Std({ color: 0x2a2a2d, roughness: 0.8 }), liner: Std({ color: 0x3a3a3c, roughness: 0.95 }),
+    cage: Std({ color: 0xc9c9c4, roughness: 0.45, metalness: 0.4 }), wheel: Std({ color: 0x141414, roughness: 0.6 }), alcantara: Std({ color: 0x2c2c2c, roughness: 1 }),
+    dial: Std({ color: 0x0b0b0b, emissive: 0xffcc66, emissiveIntensity: 0.25, roughness: 0.4 }), pillar: patchMaterial(Phys({ color: P.roofCol ?? LV.body }), U) };
+  const iBox = (sx, sy, sz, mat, x, y, z, rx = 0, ry = 0, rz = 0, parent = inside) => { const m = new THREE.Mesh(own(new THREE.BoxGeometry(sx, sy, sz)), mat); m.position.set(x, y, z); m.rotation.set(rx, ry, rz); parent.add(m); return m; };
+  const iBar = (a, b, r, mat, parent = inside) => {
+    const A = new THREE.Vector3(...a), B = new THREE.Vector3(...b);
+    const m = new THREE.Mesh(own(new THREE.CylinderGeometry(r, r, A.distanceTo(B), 8)), mat);
+    m.position.copy(A).add(B).multiplyScalar(0.5); m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), B.clone().sub(A).normalize()); parent.add(m); return m;
+  };
+  const drvX = -Math.min(0.38, hw * 0.46);
+  const yTop = H - gBev - 0.03, uDash = uA0 - 0.14;
+  // dashboard + binnacle + dial faces
+  iBox(Wb * 0.94, 0.17, 0.5, Mi.dash, 0, yBelt - 0.06, -(uDash - 0.2));
+  iBox(Wb * 0.94, 0.05, 0.16, Mi.trim, 0, yBelt + 0.01, -(uDash - 0.44), -0.5);
+  iBox(0.42, 0.11, 0.2, Mi.dash, drvX, yBelt + 0.06, -(uDash - 0.4), 0.25);
+  for (const dx of [-0.09, 0.09]) { const d = new THREE.Mesh(own(new THREE.CircleGeometry(0.055, 20)), Mi.dial); d.position.set(drvX + dx, yBelt + 0.065, -(uDash - 0.505)); d.rotation.x = -0.25; inside.add(d); }
+  // steering wheel (pivot rotates with the steering)
+  const wheelPivot = new THREE.Object3D(); wheelPivot.position.set(drvX, yBelt - 0.07, -(uDash - 0.62)); wheelPivot.rotation.x = -0.42; inside.add(wheelPivot);
+  const steerWheel = new THREE.Object3D(); wheelPivot.add(steerWheel);
+  steerWheel.add(new THREE.Mesh(own(new THREE.TorusGeometry(0.16, 0.022, 8, 28)), Mi.wheel));
+  iBox(0.33, 0.035, 0.03, Mi.wheel, 0, 0.015, 0, 0, 0, 0, steerWheel); iBox(0.035, 0.16, 0.03, Mi.wheel, 0, -0.08, 0, 0, 0, 0, steerWheel);
+  iBox(0.03, 0.04, 0.035, Std({ color: 0xffcc00, roughness: 0.5 }), 0, 0.172, 0.005, 0, 0, 0, steerWheel); // top-dead-centre marker
+  const hub = new THREE.Mesh(own(new THREE.CylinderGeometry(0.05, 0.05, 0.06, 14)), Mi.trim); hub.rotation.x = Math.PI / 2; steerWheel.add(hub);
+  iBar([drvX, yBelt - 0.07, -(uDash - 0.62) + 0.04], [drvX, yBelt - 0.14, -(uDash - 0.3)], 0.025, Mi.trim); // column
+  // dim cabin/dash glow so the interior reads at night (only lit while the interior is shown)
+  const cabinLight = new THREE.PointLight(0xffe2b0, 0.6, 1.6, 2); cabinLight.position.set(drvX * 0.5, yBelt + 0.15, -(uDash - 0.75)); inside.add(cabinLight);
+  // A-pillars, header rail, roof liner, door cards
+  mirrorX((s) => {
+    iBar([s * (gw(yBelt) - 0.05), yBelt, -(uA0 - 0.03)], [s * (gw(yTop) - 0.05), yTop, -(uA1 - 0.03)], 0.045, Mi.pillar);
+    iBox(0.035, 0.42, uA0 - uC0, Mi.trim, s * (hw - 0.07), yBelt - 0.17, -(uA0 + uC0) / 2);
+    iBox(0.08, 0.04, uA0 - uC0 - 0.2, Mi.dash, s * (hw - 0.1), yBelt + 0.0, -(uA0 + uC0) / 2); // window sill
+  });
+  iBar([-(gw(yTop) - 0.05), yTop, -(uA1 - 0.03)], [gw(yTop) - 0.05, yTop, -(uA1 - 0.03)], 0.04, Mi.pillar);
+  iBox(gw(yTop) * 2 - 0.08, 0.03, Math.max(0.2, uA1 - uC1), Mi.liner, 0, yTop - 0.02, -(uA1 + uC1) / 2);
+  // roll cage: front hoop along the pillars, main hoop behind the seats, door bars, roof cross
+  // driver's eye ~1 m behind the dash, but never behind the rear of the cabin; seats + main hoop follow it
+  const eyeU = Math.max(uC0 + 0.55, Math.min(uA1 - 0.4, uDash - 1.0));
+  const uMain = Math.min(lerp(uA1, uC1, 0.72), eyeU - 0.42), yFloor = y0 + 0.12;
+  mirrorX((s) => {
+    const xi = s * (gw(yTop) - 0.12), xl = s * (hw - 0.14);
+    iBar([xl, yFloor, -(uA0 - 0.2)], [xi, yTop - 0.06, -(uA1 - 0.12)], 0.022, Mi.cage);
+    iBar([xl, yFloor, -uMain], [xi, yTop - 0.06, -uMain], 0.024, Mi.cage);
+    iBar([xi, yTop - 0.06, -(uA1 - 0.12)], [xi, yTop - 0.06, -uMain], 0.022, Mi.cage);
+    iBar([xl, yFloor + 0.25, -(uA0 - 0.25)], [xl, yFloor + 0.3, -uMain], 0.022, Mi.cage);
+    iBar([xl, yFloor + 0.05, -(uA0 - 0.25)], [xl, yFloor + 0.42, -uMain], 0.02, Mi.cage);
+  });
+  iBar([-(gw(yTop) - 0.12), yTop - 0.06, -uMain], [gw(yTop) - 0.12, yTop - 0.06, -uMain], 0.024, Mi.cage);
+  iBar([-(gw(yTop) - 0.12), yTop - 0.06, -(uA1 - 0.12)], [gw(yTop) - 0.12, yTop - 0.06, -uMain], 0.02, Mi.cage);
+  // seats (seen when looking around / in the mirror of a replay)
+  mirrorX((s) => { const sx = s * Math.abs(drvX); iBox(0.46, 0.1, 0.5, Mi.alcantara, sx, yFloor + 0.12, -(eyeU + 0.05)); iBox(0.46, 0.75, 0.1, Mi.alcantara, sx, yFloor + 0.5, -(eyeU - 0.3), 0.18); });
+  inside.traverse((o) => { if (o.isMesh) { o.castShadow = false; o.receiveShadow = false; } });
+  // camera mounts in model space (main.js reads these): driver's eye, bumper
+  const eyes = {
+    cockpit: new THREE.Vector3(drvX, Math.min(yTop - 0.12, Math.max(yBelt + 0.3, yBelt + 0.62 * (yTop - yBelt))), -eyeU),
+    bumper: null, // set after the bumper is built
+  };
+  function setInterior(on) { inside.visible = on; for (const g of glassMeshes) g.visible = !on; }
 
   // ---------- arches: liners + flares ----------
   const archParts = [];
@@ -378,6 +441,7 @@ export function buildCarModel(spec, { quality = 'high' } = {}) {
   // ---------- bumpers, grille, splitter ----------
   const fz = -(uF + bo), rz = -(uR - bo);
   const bh = P.chromeBumper ? 0.09 : 0.17, by = y0 + (P.chromeBumper ? 0.14 : 0.08);
+  eyes.bumper = new THREE.Vector3(0, Math.max(by + bh / 2 + 0.2, 0.42), fz - 0.12);
   const bumpF = box(Wb + 0.03, bh, 0.12, M.bumper, 0, by, fz - 0.03);
   const bumpR = box(Wb + 0.03, bh, 0.12, M.bumper, 0, by, rz + 0.03);
   const yL = Math.max(y0 + 0.27, topY(0) - 0.1);
@@ -559,5 +623,5 @@ export function buildCarModel(spec, { quality = 'high' } = {}) {
   }
   setLights({});
   group.traverse((o) => { if (o.isMesh) o.receiveShadow = true; });
-  return { group, wheels, headlights, setLights, setDamage, setDirt, exhaust, flame, dispose, quality: hi ? 'high' : 'low' };
+  return { group, wheels, headlights, setLights, setDamage, setDirt, exhaust, flame, dispose, quality: hi ? 'high' : 'low', eyes, setInterior, steerWheel };
 }

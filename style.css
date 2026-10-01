@@ -194,6 +194,14 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--acc); 
 .range input::-webkit-slider-thumb { -webkit-appearance: none; width: 22px; height: 22px; margin-top: -9px; background: var(--acc); border: 0; transform: skewX(-12deg); }
 .range input::-moz-range-thumb { width: 22px; height: 22px; background: var(--acc); border: 0; border-radius: 0; }
 .range output { width: 40px; text-align: right; font-size: 14px; }
+.tune-row { align-items: center; gap: 12px; }
+.tune-row .lbl { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.tune-row .lbl small { font-size: 11px; text-transform: none; letter-spacing: 0; color: var(--mut); margin-top: 2px; line-height: 1.25; }
+.tune-row .range { max-width: 260px; flex: 1.2; }
+.tune-row .range output { width: 52px; }
+.range output.mod { color: var(--acc); font-weight: 700; }
+.garage-presets { margin-bottom: 6px; flex-wrap: wrap; gap: 10px; }
+.garage-tip { margin: 0 0 12px; }
 .tyres { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; }
 .tyre { min-height: 72px; border: 1px solid var(--line2); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
 .tyre svg { width: 30px; height: 30px; }

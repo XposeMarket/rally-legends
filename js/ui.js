@@ -299,7 +299,47 @@ export class UI {
   }
 
   // ---------- pre-stage setup ----------
-  showSetup({ car, stage, compounds = [], compound, assists = {}, onStart, onBack, difficulty = 'amateur' } = {}) {
+  // ---------- garage: car setup sliders ----------
+  // tuning = { params (grouped), presets {id:{label}}, value, base, onChange(v), onPreset(id)->v, onReset()->v }
+  showGarage({ car, tuning, onBack, overlay = false } = {}) {
+    const s = this._screen('scr-garage', { back: onBack, overlay });
+    this._head(s, 'Garage', `${car?.short || car?.name || 'Car'} setup`, onBack);
+    const body = h('div', 'scr-body');
+    let v = { ...tuning.value };
+    const pre = h('div', 'row garage-presets', '<span class="lbl">Preset</span>');
+    const segs = h('div', 'seg acc');
+    for (const [id, p] of Object.entries(tuning.presets)) { const b = h('button', '', esc(p.label)); b.onclick = () => { v = { ...tuning.onPreset(id) }; sync(); }; segs.appendChild(b); }
+    pre.appendChild(segs); body.appendChild(pre);
+    body.appendChild(h('div', 'stage-desc garage-tip', '<span style="font-size:13px">Can\'t catch slides? Raise <b>Rear grip</b> and <b>Steering angle</b>. Want it to rotate more? Lower <b>Torque to front</b>, raise <b>Rear diff lock</b>. Changes apply instantly and are saved per car.</span>'));
+    const form = h('div', 'form');
+    const ctl = {};
+    for (const g of tuning.params) {
+      if (!g.items.length) continue;
+      const grp = h('div', 'group', `<h4>${esc(g.group)}</h4>`);
+      for (const p of g.items) {
+        const r = h('div', 'row tune-row');
+        const lab = h('span', 'lbl', `${esc(p.label)}<small>${esc(p.hint || '')}</small>`);
+        const w = h('div', 'range');
+        const i = h('input'); i.type = 'range'; i.min = p.min; i.max = p.max; i.step = p.step; i.setAttribute('aria-label', p.label);
+        const o = h('output', 'num');
+        const fmt = (x) => (p.id === 'arbBal' && x > 0 ? '+' : '') + x + (p.unit || '');
+        i.oninput = () => { v[p.id] = +i.value; o.textContent = fmt(+i.value); o.classList.toggle('mod', +i.value !== tuning.base[p.id]); tuning.onChange({ ...v }); };
+        ctl[p.id] = () => { i.value = v[p.id]; o.textContent = fmt(v[p.id]); o.classList.toggle('mod', v[p.id] !== tuning.base[p.id]); };
+        w.append(i, o); r.append(lab, w); grp.appendChild(r);
+      }
+      form.appendChild(grp);
+    }
+    const sync = () => { for (const f of Object.values(ctl)) f(); tuning.onChange({ ...v }); };
+    for (const f of Object.values(ctl)) f();
+    body.appendChild(form); s.appendChild(body);
+    const foot = h('footer', 'scr-foot');
+    const rs = h('button', 'btn ghost', 'Reset to default'); rs.onclick = () => { v = { ...tuning.onReset() }; sync(); };
+    const done = h('button', 'btn primary', 'Done'); done.onclick = () => onBack?.();
+    foot.append(rs, done); s.appendChild(foot);
+    return s;
+  }
+
+  showSetup({ car, stage, compounds = [], compound, assists = {}, onStart, onBack, difficulty = 'amateur', onGarage, setupLabel = '' } = {}) {
     const a = { autoGear: true, steerAssist: 0.3, tcs: false, abs: false, ...assists };
     let comp = compound ?? compounds[0]?.id; let diff = String(difficulty).toLowerCase();
     const start = () => onStart?.({ compound: comp, assists: { ...a }, difficulty: diff });
@@ -315,6 +355,14 @@ export class UI {
     const tbtns = compounds.map((c) => { const b = h('button', 'tyre', `${tyreIcon(tcol(c.id))}${esc(c.label)}`); b.onclick = () => { comp = c.id; tb(); }; ty.appendChild(b); return [b, c.id]; });
     const tb = () => tbtns.forEach(([b, id]) => b.classList.toggle('on', id === comp)); tb();
     gT.appendChild(compounds.length ? ty : h('div', 'empty', 'Standard compound')); form.appendChild(gT);
+    // car setup
+    if (onGarage) {
+      const gG = h('div', 'group', '<h4>Car setup</h4>');
+      const r = h('div', 'row', `<span class="lbl">${esc(setupLabel || 'Default')}</span>`);
+      const b = h('button', 'btn', 'Tune car <span aria-hidden="true">›</span>'); b.onclick = () => onGarage(); r.appendChild(b); gG.appendChild(r);
+      gG.appendChild(h('div', 'stage-desc', '<span style="font-size:13px">Front/rear grip, steering angle, torque split, diff, brakes, springs.</span>'));
+      form.appendChild(gG);
+    }
     // assists
     const gA = h('div', 'group', '<h4>Assists</h4>');
     const tog = (lbl, key) => { const r = h('div', 'row', `<span class="lbl">${lbl}</span>`); const t = h('button', 'toggle'); t.setAttribute('aria-label', lbl); const f = () => { t.classList.toggle('on', !!a[key]); t.setAttribute('aria-pressed', !!a[key]); }; t.onclick = () => { a[key] = !a[key]; f(); }; f(); r.appendChild(t); return r; };
@@ -395,11 +443,11 @@ export class UI {
   }
 
   // ---------- pause ----------
-  showPause({ onResume, onRestart, onRecover, onSettings, onQuit } = {}) {
+  showPause({ onResume, onRestart, onRecover, onSettings, onQuit, onGarage } = {}) {
     const s = this._screen('scr-pause', { back: onResume, overlay: true });
     const box = h('div', 'pause-box', '<h2>Paused</h2>');
     const add = (l, fn, cls = '') => { if (!fn) return; const b = h('button', 'btn ' + cls, esc(l)); b.onclick = fn; box.appendChild(b); };
-    add('Resume', onResume, 'primary'); add('Recover car', onRecover); add('Restart stage', onRestart); add('Settings', onSettings); add('Quit to menu', onQuit, 'danger');
+    add('Resume', onResume, 'primary'); add('Recover car', onRecover); add('Restart stage', onRestart); add('Car setup', onGarage); add('Settings', onSettings); add('Quit to menu', onQuit, 'danger');
     s.appendChild(box);
     requestAnimationFrame(() => box.querySelector('button')?.focus({ preventScroll: true }));
     return s;
